@@ -15,6 +15,7 @@ import { homedir, platform } from 'node:os';
 import { existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 
 const HOME = homedir();
 const CACHE_DIR = join(HOME, '.dsh', 'dsh-skill-matcher');
@@ -239,6 +240,16 @@ export function collectExperts(cwd) {
   return items;
 }
 
+export function isTrustedInstall(install) {
+  // 安装白名单：仅官方/知名可信前缀自动执行，其余一律需用户确认。
+  if (!install) return false;
+  const s = String(install).trim();
+  if (s.startsWith('skillhub install ')) return true;
+  if (s.startsWith('git clone https://github.com/anthropics/')) return true;
+  if (s.startsWith('git clone https://github.com/axel286137079-dot/')) return true;
+  return false;
+}
+
 export async function fetchRemoteSkills(offline) {
   if (offline) return [];
   try {
@@ -247,7 +258,19 @@ export async function fetchRemoteSkills(offline) {
     const res = await fetch(DEFAULT_REMOTE.url, { signal: ac.signal });
     clearTimeout(timer);
     if (!res.ok) return [];
-    const data = await res.json();
+    // 防篡改：拉取内容 SHA256，与上次记录比对，不一致拒绝更新
+    const buf = Buffer.from(await res.arrayBuffer());
+    const digest = createHash('sha256').update(buf).digest('hex');
+    const known = readCache()?.remoteHashes?.[DEFAULT_REMOTE.url];
+    if (known && known !== digest) {
+      console.warn('[skill-matcher] remote index SHA256 mismatch; keep old version (source may be tampered)');
+      return [];
+    }
+    const data = JSON.parse(buf.toString('utf-8'));
+    if (!known) {
+      const prev = readCache() || {};
+      writeCache({ ...prev, remoteHashes: { ...(prev.remoteHashes || {}), [DEFAULT_REMOTE.url]: digest } });
+    }
     const lst = Array.isArray(data) ? data : (data.skills || data.plugins || []);
     return lst
       .filter((it) => it && (it.id || it.name))
@@ -340,7 +363,9 @@ export async function getIndex({ cwd, offline = false } = {}) {
   const merged = mergeByPriority(idx.skills, remote.length ? remote : SEED_OPENSOURCE);
   const expertIds = new Set(idx.experts.map((e) => e.id));
   const finalSkills = merged.filter((s) => !expertIds.has(s.id));
-  const wrapped = { skills: finalSkills, experts: idx.experts, builtAt: now, offline: false };
+  const prev = readCache() || {};
+  const wrapped = { skills: finalSkills, experts: idx.experts, builtAt: now, offline: false,
+    remoteHashes: prev.remoteHashes || {} };
   _memCache = wrapped;
   writeCache(wrapped);
   return wrapped;
