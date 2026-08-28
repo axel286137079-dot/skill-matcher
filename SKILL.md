@@ -74,21 +74,29 @@ platforms: [workbuddy, claude-code, cursor]
 4. 综合「匹配度 + 是否已装 + 用户真实意图」排序，取 Top3。
 5. 按下方格式输出。
 
-## 匹配即安装（一键闭环，默认动作）
+## 匹配即安装（一键闭环 + 安全护栏）
 
-匹配出 Top3 后，**默认直接尝试把未装的装上**，不让用户手动去添加：
+匹配出 Top3 后，对未装的条目**按安全规则自动安装**（不让用户手动去添加，但绝不无脑执行陌生命令）：
 
-1. 对 Top3 中未装的条目，按来源执行安装：
-   - `source=marketplace`（WorkBuddy 推荐市场）：调用 `workbuddy_marketplace_skill` 工具（action=install，传 skillId）；若不在推荐市场，回退调用 `marketplace-skill-installer` 或 `find-skills` 技能。
-   - `source=marketplace`（SkillHub 社区源，install 字段含 `skillhub install ...`）：用 Bash 直接执行该命令（`skillhub install <slug> --namespace <ns>`，官方 CLI 已装于 `~/.local/bin/skillhub`）。
-   - `source=opensource`（install 字段为 git/下载命令）：用 Bash 执行（clone 到对应技能目录）。安装命令均来自索引条目自身的 install 字段（公开仓库/官方命令），执行前核对 URL/命令来源，绝不执行来历不明的脚本。
-   - `source=local`：已装，无需安装。
-2. 逐个执行并确认结果：
-   - 成功 → 输出「**✅ 已自动安装 <名称>，现在就能用**」
-   - 失败 → 给出一条可直接复制运行的命令 + 失败原因，不要停在"请手动去添加"
-3. 除非用户明确说"只要推荐，先别装"，否则一律走自动安装。
+**安装白名单**（仅以下来源自动执行，白名单外一律先展示完整命令、请用户确认后再装）：
+- `source=local`：已装，跳过。
+- `source=marketplace`（WorkBuddy 推荐市场）：调 `workbuddy_marketplace_skill`（action=install）等官方安装通道。
+- `source=marketplace`（SkillHub 社区源，install 形如 `skillhub install <slug> --namespace <ns>`）：用 Bash 执行 `skillhub install`（官方 CLI；可先 `skillhub security <slug>` 查看安全结论）。
+- `source=opensource`：仅当 install 字段以**可信前缀**开头才自动执行：
+  - `https://github.com/axel286137079-dot/`（本目录官方维护）
+  - `https://github.com/anthropics/`（知名官方技能库）
+  - 白名单外的 GitHub 仓库 → 展示 `git clone` 命令与仓库地址，请用户确认后执行。
 
-专家（experts.json）无需安装：命中专家时直接说明如何启用/使用即可。
+**自动执行红线**：任何 `curl ... | sh/bash`、`wget` 管道执行、陌生域名脚本、非白名单来源的 install → **一律禁止自动执行**，展示完整命令 + 来源，请用户确认。
+
+**远程索引安全（防源被替换带毒）**：
+- `index/_sources.json` 的远程索引：首次拉取成功后，把内容 SHA256 记入 `index/_remote_hashes.json`；之后每次拉取**先校验哈希**，不一致则**拒绝更新并告警**（提示源可能被篡改，保持旧版继续用）。
+- 索引同步与贡献合并保持 opt-in + 共识 + 审计红线（见 CONTRIBUTING.md）。
+
+**执行纪律**：
+- 自动安装前核对 install 命令来自白名单/官方源；装完输出「**✅ 已自动安装 <名称>，现在就能用**」；白名单外经用户确认后装的输出「✅ 已确认安装」。
+- 安装失败 → 给出一条可直接复制运行的命令 + 原因，不停在"请手动去添加"。
+- 用户明确"只要推荐，先别装"时，只给推荐。专家（experts.json）无需安装，命中时直接说明如何启用/使用。
 
 ## 输出格式
 
