@@ -27,6 +27,7 @@
   python3 bin/sync_index.py --submit-contribution    # 一键贡献：挑选→生成文件→gh已登录则自动推送
 """
 
+import hashlib
 import json
 import os
 import re
@@ -36,6 +37,21 @@ import urllib.request
 from pathlib import Path
 
 OUT_DIR = Path(__file__).resolve().parent.parent / "index"
+HASH_FILE = OUT_DIR / "_remote_hashes.json"
+
+
+def _load_remote_hashes():
+    """读取远程索引哈希记录（url -> sha256），用于防篡改校验。"""
+    try:
+        return json.loads(HASH_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_remote_hash(url, digest):
+    h = _load_remote_hashes()
+    h[url] = digest
+    write_json(HASH_FILE, h)
 
 
 # ---------- 1. 环境探测 ----------
@@ -227,7 +243,16 @@ def fetch_remote_skills(offline=False):
             continue
         try:
             with urllib.request.urlopen(url, timeout=5) as r:
-                data = json.loads(r.read().decode("utf-8"))
+                raw = r.read()
+            digest = hashlib.sha256(raw).hexdigest()
+            known = _load_remote_hashes().get(url)
+            if known and known != digest:
+                print(f"  [remote] {s.get('name', url)} 内容哈希与上次不一致，已拒绝更新"
+                      f"（源可能被篡改，保持旧版；如确为正常更新请清除 index/_remote_hashes.json）")
+                continue
+            data = json.loads(raw.decode("utf-8"))
+            if not known:
+                _save_remote_hash(url, digest)
             lst = data if isinstance(data, list) else (data.get("skills") or data.get("plugins") or [])
             for it in lst:
                 if not it.get("id") and not it.get("name"):
