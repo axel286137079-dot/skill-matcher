@@ -74,15 +74,21 @@ platforms: [workbuddy, claude-code, cursor]
 4. 综合「匹配度 + 是否已装 + 用户真实意图」排序，取 Top3。
 5. 按下方格式输出。
 
-## 一键安装闭环
+## 匹配即安装（一键闭环，默认动作）
 
-推荐到 `source=marketplace` 的技能（未装）时，不要只报名字，主动把安装接上：
+匹配出 Top3 后，**默认直接尝试把未装的装上**，不让用户手动去添加：
 
-- 优先：调用 `find-skills` 技能（官方，支持从 Vercel Skills / ClawHub 发现安装）
-- 或：调用 `marketplace-skill-installer` 技能（从推荐市场一句话安装）
-- 或：用 `workbuddy_marketplace_skill` 工具（action=install，传 skillId）
+1. 对 Top3 中未装的条目，按来源执行安装：
+   - `source=marketplace`（WorkBuddy 推荐市场）：调用 `workbuddy_marketplace_skill` 工具（action=install，传 skillId）；若不在推荐市场，回退调用 `marketplace-skill-installer` 或 `find-skills` 技能。
+   - `source=marketplace`（SkillHub 社区源，install 字段含 `skillhub install ...`）：用 Bash 直接执行该命令（`skillhub install <slug> --namespace <ns>`，官方 CLI 已装于 `~/.local/bin/skillhub`）。
+   - `source=opensource`（install 字段为 git/下载命令）：用 Bash 执行（clone 到对应技能目录）。安装命令均来自索引条目自身的 install 字段（公开仓库/官方命令），执行前核对 URL/命令来源，绝不执行来历不明的脚本。
+   - `source=local`：已装，无需安装。
+2. 逐个执行并确认结果：
+   - 成功 → 输出「**✅ 已自动安装 <名称>，现在就能用**」
+   - 失败 → 给出一条可直接复制运行的命令 + 失败原因，不要停在"请手动去添加"
+3. 除非用户明确说"只要推荐，先别装"，否则一律走自动安装。
 
-`source=local` 的技能（已装）和专家（experts.json）无需安装，直接引导使用/启用即可。
+专家（experts.json）无需安装：命中专家时直接说明如何启用/使用即可。
 
 ## 输出格式
 
