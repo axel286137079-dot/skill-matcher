@@ -1,0 +1,10 @@
+# 本地生成的机器相关文件（不入库）
+index/skills.json
+index/experts.json
+index/feedback.jsonl
+index/contributions/
+bin/__pycache__/
+
+# 系统/工具
+.DS_Store
+*.log
