@@ -1,0 +1,106 @@
+[
+  {
+    "id": "docx",
+    "name": "docx",
+    "description": "创建和编辑 Microsoft Word 文档（.docx）：从零生成、排版、批注。Official Anthropic document skill.",
+    "install": "git clone https://github.com/anthropics/skills",
+    "source": "opensource",
+    "origin": "anthropics/skills"
+  },
+  {
+    "id": "pdf",
+    "name": "pdf",
+    "description": "PDF 文档处理：读取、提取文本/表格、合并拆分、生成 PDF。Official Anthropic document skill.",
+    "install": "git clone https://github.com/anthropics/skills",
+    "source": "opensource",
+    "origin": "anthropics/skills"
+  },
+  {
+    "id": "pptx",
+    "name": "pptx",
+    "description": "创建和编辑 PowerPoint 演示文稿（.pptx），支持模板与图表。Official Anthropic document skill.",
+    "install": "git clone https://github.com/anthropics/skills",
+    "source": "opensource",
+    "origin": "anthropics/skills"
+  },
+  {
+    "id": "xlsx",
+    "name": "xlsx",
+    "description": "创建和编辑 Excel 表格（.xlsx）：数据、公式、图表、格式。Official Anthropic document skill.",
+    "install": "git clone https://github.com/anthropics/skills",
+    "source": "opensource",
+    "origin": "anthropics/skills"
+  },
+  {
+    "id": "artifacts-builder",
+    "name": "artifacts-builder",
+    "description": "构建可运行的 Web 应用原型（HTML/CSS/JS），适合快速做交互 demo。Official Anthropic skill.",
+    "install": "git clone https://github.com/anthropics/skills",
+    "source": "opensource",
+    "origin": "anthropics/skills"
+  },
+  {
+    "id": "webapp-testing",
+    "name": "webapp-testing",
+    "description": "Web 应用测试：用 Playwright 编写并执行端到端测试。Official Anthropic skill.",
+    "install": "git clone https://github.com/anthropics/skills",
+    "source": "opensource",
+    "origin": "anthropics/skills"
+  },
+  {
+    "id": "brand-guidelines",
+    "name": "brand-guidelines",
+    "description": "品牌视觉规范设计与一致性检查（logo 使用、配色、字体）。Official Anthropic skill.",
+    "install": "git clone https://github.com/anthropics/skills",
+    "source": "opensource",
+    "origin": "anthropics/skills"
+  },
+  {
+    "id": "image-editing",
+    "name": "image-editing",
+    "description": "图像编辑与处理（裁剪、滤镜、合成），配合图像生成模型使用。Official Anthropic skill.",
+    "install": "git clone https://github.com/anthropics/skills",
+    "source": "opensource",
+    "origin": "anthropics/skills"
+  },
+  {
+    "id": "mcp-builder",
+    "name": "mcp-builder",
+    "description": "构建 MCP 服务器：从需求到可运行的服务端代码。Official Anthropic skill.",
+    "install": "git clone https://github.com/anthropics/skills",
+    "source": "opensource",
+    "origin": "anthropics/skills"
+  },
+  {
+    "id": "mcp-architect",
+    "name": "mcp-architect",
+    "description": "MCP 架构设计：规划服务器结构、工具清单与连接方案。Official Anthropic skill.",
+    "install": "git clone https://github.com/anthropics/skills",
+    "source": "opensource",
+    "origin": "anthropics/skills"
+  },
+  {
+    "id": "slack-gif-creator",
+    "name": "slack-gif-creator",
+    "description": "创建 Slack GIF：脚本生成动画并上传。Official Anthropic skill.",
+    "install": "git clone https://github.com/anthropics/skills",
+    "source": "opensource",
+    "origin": "anthropics/skills"
+  },
+  {
+    "id": "video-editing",
+    "name": "video-editing",
+    "description": "视频编辑：剪辑、字幕、转场（ffmpeg）。Official Anthropic skill.",
+    "install": "git clone https://github.com/anthropics/skills",
+    "source": "opensource",
+    "origin": "anthropics/skills"
+  },
+  {
+    "id": "canvas-design",
+    "name": "canvas-design",
+    "description": "设计画布排版与设计规范。Official Anthropic skill.",
+    "install": "git clone https://github.com/anthropics/skills",
+    "source": "opensource",
+    "origin": "anthropics/skills"
+  }
+]
