@@ -1,0 +1,18 @@
+# dsh-skill-matcher bundle patch: inserts the host-half plugin row into the web
+# profile roster. Applied as a profile bundle layer (the `dsh.bundle.patch`
+# manifest field) over dsh-base; activate with
+#   dsh plugin --profile web add file:/Users/suge/dsh-skill-matcher
+# or, for published distribution,
+#   dsh plugin --profile web add github:axel286137079-dot/dsh-skill-matcher
+#
+# The row is a bare plugin by package name: the node half (exports ".") registers
+# the skill_matcher_scan / skill_matcher_match / skill_matcher_list tools and the
+# system-prompt guidance section; the agent LLM performs the four-layer need
+# understanding (L0->L3) over the tool's recalled candidates.
+#
+# Optional config (default true):
+#   config:
+#     enabled: true          # master switch (tools + prompt section)
+- insert:
+    - id: skill-matcher
+      name: dsh-skill-matcher
