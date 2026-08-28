@@ -3,6 +3,7 @@ index/skills.json
 index/experts.json
 index/feedback.jsonl
 index/contributions/
+index/_remote_hashes.json
 bin/__pycache__/
 
 # 系统/工具
