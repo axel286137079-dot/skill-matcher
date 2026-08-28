@@ -1,0 +1,10 @@
+{
+  "_comment": "远程开源索引源。联网同步时自动拉取并合并（失败静默跳过，离线可用）。每个源必须返回 JSON：数组（条目含 id/name/description/install）或 {skills:[...]}。",
+  "remote_indexes": [
+    {
+      "name": "skill-matcher 官方开源目录",
+      "url": "https://raw.githubusercontent.com/axel286137079-dot/skill-matcher-index/main/index.json",
+      "install_hint": "见条目 install 字段"
+    }
+  ]
+}
