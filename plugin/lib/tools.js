@@ -8,7 +8,7 @@
  * is performed by the LLM using these candidates; the tools only do L0/L1 recall + ranking.
  */
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import { getIndex, buildIndex, match, SENSITIVE_KEYWORDS } from './engine.js';
+import { getIndex, buildIndex, match, isTrustedInstall, SENSITIVE_KEYWORDS } from './engine.js';
 
 /** One text content block (the only render shape these tools emit). */
 function text(value) {
@@ -95,7 +95,10 @@ export function skillMatcherMatchTool() {
         out += `${i + 1}. ${e.name} ｜ ${e.kind === 'expert' ? '专家' : '技能'} · ${status} · 匹配度 ${e.score}\n`;
         out += `   说明: ${e.description}\n`;
         out += `   命中关键词: ${e.matched.slice(0, 8).join('、') || '—'}\n`;
-        if (e.install) out += `   安装: ${e.install}\n`;
+        if (e.install) {
+          const trusted = isTrustedInstall(e.install);
+          out += `   安装: ${e.install}${trusted ? '' : '（白名单外，需确认后执行）'}\n`;
+        }
         out += `   id: ${e.id}\n\n`;
       });
       out += '（匹配排序中立，由需求匹配度决定。提示：对未装且可安装的条目，默认直接安装——SkillHub 源用 `skillhub install <slug> --namespace <ns>`，或按条目 install 字段执行；装完告知用户「已装好」。）';
