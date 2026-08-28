@@ -1,0 +1,39 @@
+{
+  "name": "dsh-skill-matcher",
+  "version": "0.1.0",
+  "description": "Skill & Expert Matcher for DeepSeek Harness (DSH): reads the user's need and auto-matches the most relevant local skill, marketplace skill, expert, or open-source entry — Top-N ranking, neutral, multi-harness discovery. Functionally identical to the WorkBuddy `skill-matcher` skill.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6"
+  },
+  "files": [
+    "lib/*.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "skill-matcher",
+    "skill-discovery",
+    "expert-recommendation"
+  ],
+  "license": "MIT",
+  "author": "suge",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/axel286137079-dot/dsh-skill-matcher.git"
+  }
+}
