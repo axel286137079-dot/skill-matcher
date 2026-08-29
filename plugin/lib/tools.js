@@ -90,7 +90,7 @@ export function skillMatcherMatchTool() {
       if (hits.length === 0) {
         return { text: `没有匹配到「${args.query}」的相关技能或专家。可换种说法，或先调用 skill_matcher_list 浏览本机已装能力。` };
       }
-      const intentLabel = { decision: '决策/情绪（优先决策·风控·心理支持类）', howto: '操作步骤', explain: '解释说明', general: '一般' }[intent] || '一般';
+      const intentLabel = { decision: '决策/情绪（优先决策·风控·心理支持类）', build: '开发/构建（优先开发·设计·工程类）', howto: '操作步骤', explain: '解释说明', general: '一般' }[intent] || '一般';
       let out = `匹配「${args.query}」Top ${hits.length}（意图识别：${intentLabel}；已装技能已加权优先）：\n\n`;
       hits.forEach((e, i) => {
         const status = e.source === 'local' ? '已装' : (e.source === 'marketplace' ? '市场未装（可装）' : '开源');
