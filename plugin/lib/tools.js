@@ -8,7 +8,7 @@
  * is performed by the LLM using these candidates; the tools only do L0/L1 recall + ranking.
  */
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import { getIndex, buildIndex, match, isTrustedInstall, SENSITIVE_KEYWORDS } from './engine.js';
+import { getIndex, buildIndex, match, detectIntent, isTrustedInstall, SENSITIVE_KEYWORDS } from './engine.js';
 
 /** One text content block (the only render shape these tools emit). */
 function text(value) {
@@ -85,23 +85,26 @@ export function skillMatcherMatchTool() {
       const offline = args.offline === true;
       const cwd = args.cwd || cwdOf(exec);
       const idx = offline ? buildIndex(cwd, { offline: true }) : await getIndex({ cwd, offline: false });
+      const intent = detectIntent(args.query);
       const hits = match(args.query, idx, { topN, includeExperts });
       if (hits.length === 0) {
         return { text: `没有匹配到「${args.query}」的相关技能或专家。可换种说法，或先调用 skill_matcher_list 浏览本机已装能力。` };
       }
-      let out = `匹配「${args.query}」Top ${hits.length}：\n\n`;
+      const intentLabel = { decision: '决策/情绪（优先决策·风控·心理支持类）', howto: '操作步骤', explain: '解释说明', general: '一般' }[intent] || '一般';
+      let out = `匹配「${args.query}」Top ${hits.length}（意图识别：${intentLabel}；已装技能已加权优先）：\n\n`;
       hits.forEach((e, i) => {
         const status = e.source === 'local' ? '已装' : (e.source === 'marketplace' ? '市场未装（可装）' : '开源');
         out += `${i + 1}. ${e.name} ｜ ${e.kind === 'expert' ? '专家' : '技能'} · ${status} · 匹配度 ${e.score}\n`;
+        out += `   匹配理由: ${e.reason}\n`;
         out += `   说明: ${e.description}\n`;
-        out += `   命中关键词: ${e.matched.slice(0, 8).join('、') || '—'}\n`;
         if (e.install) {
           const trusted = isTrustedInstall(e.install);
           out += `   安装: ${e.install}${trusted ? '' : '（白名单外，需确认后执行）'}\n`;
         }
         out += `   id: ${e.id}\n\n`;
       });
-      out += '（匹配排序中立，由需求匹配度决定。提示：对未装且可安装的条目，默认直接安装——SkillHub 源用 `skillhub install <slug> --namespace <ns>`，或按条目 install 字段执行；装完告知用户「已装好」。）';
+      out += `（索引更新于 ${new Date(idx.builtAt || Date.now()).toLocaleString('zh-CN', { hour12: false })}，24h 内自动刷新；排序中立，仅由匹配度+已装加权决定。）\n`;
+      out += '对未装且可安装的条目，默认直接安装——SkillHub 源用 `skillhub install <slug> --namespace <ns>`，或按条目 install 字段执行；装完告知用户「已装好」。';
       return { text: out };
     },
   });
