@@ -230,7 +230,7 @@ def collect_experts():
                 if not dn:
                     continue
                 items.append({
-                    "id": d.get("name") or d.get("agentName") or pj.parents[1].name,
+                    "id": d.get("id") or d.get("name") or d.get("agentName") or pj.parents[1].name,
                     "displayName_zh": _pick(d, "displayName", "zh"),
                     "displayName_en": _pick(d, "displayName", "en"),
                     "description_zh": _pick(d, "displayDescription", "zh"),
