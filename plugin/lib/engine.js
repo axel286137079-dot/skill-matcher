@@ -4,15 +4,16 @@
  * Faithful JS port of the WorkBuddy `skill-matcher` skill's bin/sync_index.py:
  *   - environment discovery (multi-harness, no hardcoded absolute paths)
  *   - local skill / expert parsing (SKILL.md frontmatter + plugin.json)
- *   - remote open-source index fetch (fail-silent, offline-safe)
+ *   - remote open-source index fetch (fail-silent, offline-safe, SHA256 anti-tamper)
  *   - priority merge (local > marketplace > opensource)
- *   - keyword recall scoring (L0/L1); deeper L2/L3 reasoning stays with the LLM.
+ *   - lexical retrieval (L0/L1): concept/alias canonicalization + IDF + multi-path recall;
+ *     deeper L2/L3 reasoning stays with the LLM.
  *
  * Embedded seed = the skill's `_manual_skills.json` opensource catalog, so the
  * plugin works offline out of the box. Cache lives under ~/.dsh/dsh-skill-matcher.
  */
 import { homedir, platform } from 'node:os';
-import { existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync, statSync, appendFileSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
@@ -20,6 +21,8 @@ import { createHash } from 'node:crypto';
 const HOME = homedir();
 const CACHE_DIR = join(HOME, '.dsh', 'dsh-skill-matcher');
 const CACHE_FILE = join(CACHE_DIR, 'cache.json');
+const CONFIG_FILE = join(CACHE_DIR, 'config.json');
+const LOG_FILE = join(CACHE_DIR, 'query.log.jsonl');
 const FRESH_MS = 24 * 60 * 60 * 1000;
 
 const DEFAULT_REMOTE = {
@@ -247,6 +250,13 @@ export function collectSkills(cwd) {
   return { items, localIds };
 }
 
+/** 专家 id 兜底：plugin.json 未显式声明 id 时，才用路径推导并告警。 */
+function fallbackExpertId(pj) {
+  const derived = (pj.split('/').slice(-4, -3)[0]) || '';
+  if (derived) console.warn(`[skill-matcher] 专家 plugin.json 缺 id 字段，用路径推导（易错，建议补 id）: ${derived}`);
+  return derived;
+}
+
 export function collectExperts(cwd) {
   const items = [];
   for (const root of discoverExpertRoots(cwd)) {
@@ -258,7 +268,7 @@ export function collectExperts(cwd) {
         const dn = d.displayName;
         if (!dn) continue;
         items.push({
-          id: d.name || d.agentName || (pj.split('/').slice(-4, -3)[0]) || '',
+          id: d.id || d.name || d.agentName || fallbackExpertId(pj),
           name: pickBilingual(d, 'displayName', 'zh') || pickBilingual(d, 'displayName', 'en') || dn,
           description: pickBilingual(d, 'displayDescription', 'zh') || pickBilingual(d, 'displayDescription', 'en'),
           source: 'local', kind: 'expert',
@@ -288,12 +298,10 @@ export function collectExperts(cwd) {
 }
 
 export function isTrustedInstall(install) {
-  // 安装白名单：仅官方/知名可信前缀自动执行，其余一律需用户确认。
+  // 安装白名单：仅官方 SkillHub CLI 命令自动执行；git clone 一律需用户确认（供应链防投毒）。
   if (!install) return false;
   const s = String(install).trim();
   if (s.startsWith('skillhub install ')) return true;
-  if (s.startsWith('git clone https://github.com/anthropics/')) return true;
-  if (s.startsWith('git clone https://github.com/axel286137079-dot/')) return true;
   return false;
 }
 
@@ -353,38 +361,340 @@ export function mergeByPriority(auto, manual) {
   return [...merged.values()];
 }
 
-/** 同名去重：同一技能可能装于多环境（如 skill-matcher 与 skill-matcher__skillhub），
- *  优先保留 id === name 的规范条目，避免列表里出现两条同名。 */
+/** 同名去重：同一来源下同名只留一条（如 skill-matcher 与 skill-matcher__skillhub 同 local 同名，
+ *  优先保留 id === name 的规范条目）；跨来源同名（本地旧版 vs 市场新版）视为不同条目，互不吞并。 */
 export function dedupeByName(items) {
-  const byName = new Map();
+  const byKey = new Map();
   for (const s of items) {
-    const key = s.name || s.id;
-    const cur = byName.get(key);
-    if (!cur) byName.set(key, s);
-    else if (cur.id !== cur.name && s.id === s.name) byName.set(key, s);
+    const key = `${s.source || ''}\u0000${s.name || s.id}`;
+    const cur = byKey.get(key);
+    if (!cur) byKey.set(key, s);
+    else if (cur.id !== cur.name && s.id === s.name) byKey.set(key, s);
   }
-  return [...byName.values()];
+  return [...byKey.values()];
 }
 
-export function buildIndex(cwd, { offline = false } = {}) {
-  const { items: skillsAuto, localIds } = collectSkills(cwd);
-  const remote = fetchRemoteSkillsSync(offline);
-  for (const r of remote) if (!skillsAuto.find((s) => s.id === r.id)) skillsAuto.push(r);
-  const skills = mergeByPriority(skillsAuto, SEED_OPENSOURCE);
-  const expertsAuto = collectExperts(cwd);
-  let experts = expertsAuto;
-  // experts never enter the skill list
-  const expertIds = new Set(experts.map((e) => e.id));
-  const skillsFinal = skills.filter((s) => !expertIds.has(s.id));
-  return { skills: dedupeByName(skillsFinal), experts };
+// ---------- config (externalized weights/match/logging) ----------
+
+const DEFAULT_CONFIG = {
+  scoring: {
+    nameExact: 8,   // 名称完全命中
+    namePartial: 6, // 名称包含
+    tag: 4,         // 标签命中
+    desc: 1.5,      // 描述词频权重（已归一化长度）
+    descCap: 3,     // 描述词频封顶
+    lengthB: 0.5,   // 长度归一化指数（越大惩罚越长）
+    tieEps: 1.0,    // 相关度差 < 此值视为接近，触发 local 优先
+  },
+  match: {
+    candidateK: 15, // 召回条数（交给 LLM 的候选池）
+    displayN: 5,    // 默认展示条数
+    expertSlots: 2, // 专家展示配额
+  },
+  logging: { enabled: false },
+};
+
+let _cfg = null;
+let _cfgMtime = 0;
+
+/** 读取外部配置（可选 ~/.dsh/dsh-skill-matcher/config.json），损坏/缺失回退内置默认。 */
+export function loadConfig(force = false) {
+  if (!force && _cfg) return _cfg;
+  try {
+    if (existsSync(CONFIG_FILE)) {
+      const st = statSync(CONFIG_FILE);
+      if (!force && _cfg && st.mtimeMs === _cfgMtime) return _cfg;
+      const raw = JSON.parse(readFileSync(CONFIG_FILE, 'utf8'));
+      _cfg = deepMerge(structuredClone(DEFAULT_CONFIG), raw);
+      _cfgMtime = st.mtimeMs;
+      return _cfg;
+    }
+  } catch (e) {
+    console.warn('[skill-matcher] config 读取失败，回退内置默认:', e?.message || e);
+  }
+  _cfg = structuredClone(DEFAULT_CONFIG);
+  return _cfg;
 }
 
-// fetchRemoteSkills is async; provide a sync wrapper for buildIndex convenience.
-function fetchRemoteSkillsSync(offline) {
-  if (offline) return [];
-  // best-effort synchronous probe via a microtask is awkward; delegate to cache.
-  // We re-run async path from callers that need freshness; offline uses seed only.
-  return [];
+function deepMerge(base, patch) {
+  if (!patch || typeof patch !== 'object') return base;
+  for (const k of Object.keys(patch)) {
+    const v = patch[k];
+    if (v && typeof v === 'object' && !Array.isArray(v) && base[k] && typeof base[k] === 'object') {
+      deepMerge(base[k], v);
+    } else {
+      base[k] = v;
+    }
+  }
+  return base;
+}
+
+/** 本地目录指纹：轻量（只 stat 顶层技能/专家目录 + 目录内条目数），检测「装了/删了新技能」。 */
+function computeLocalFingerprint(cwd) {
+  const dirs = [...discoverSkillDirs(cwd), ...discoverBuiltinSkillDirs(), ...discoverExpertRoots(cwd)];
+  const parts = [];
+  for (const d of dirs) {
+    try {
+      const st = statSync(d);
+      parts.push(`${d}:${st.mtimeMs}:${readdirSync(d).length}`);
+    } catch { parts.push(`${d}:missing`); }
+  }
+  return createHash('sha1').update(parts.join('|')).digest('hex').slice(0, 16);
+}
+
+/** 查询日志（默认关）：一行 JSONL，只记 query + top ids，不记用户上下文。 */
+export function logQuery(row) {
+  const cfg = loadConfig();
+  if (!cfg.logging?.enabled) return;
+  try {
+    mkdirSync(CACHE_DIR, { recursive: true });
+    appendFileSync(LOG_FILE, JSON.stringify({ ts: Date.now(), ...row }) + '\n', 'utf8');
+  } catch { /* ignore */ }
+}
+
+// ---------- 5. matching (concept/alias canonicalization + IDF + multi-path recall) ----------
+
+// 中文停用字/词：过滤"个/要/需要"这类无信息量的 token，避免无关条目靠虚词得分。
+const CJK_STOP_CHARS = new Set(['的', '了', '我', '你', '他', '她', '它', '个', '要', '需', '想', '是', '和', '与',
+  '或', '在', '也', '就', '都', '吗', '呢', '吧', '啊', '么', '很', '做', '用', '有', '没', '不', '给', '让', '请', '帮', '好', '会', '能', '这', '那', '这', '些']);
+const CJK_STOP_BIGRAMS = new Set(['需要', '可以', '能够', '我们', '你们', '他们', '这个', '那个', '什么', '怎么',
+  '为什么', '如何', '一个', '一些', '这种', '这样', '那样', '就是', '不是', '还有', '自己', '事情', '东西',
+  '问题', '时候', '现在', '已经', '一直', '真的', '其实', '但是', '因为', '所以', '如果', '然后', '知道',
+  '想要', '希望', '应该', '可能', '觉得', '想要', '帮我', '请问']);
+
+// concept 规范化表：中英双向归一到同一 canonical id（查询词与索引词先 canonize 再匹配）。
+// 这样「量化/quant/quantitative」全命中同一 id，跨语言召回在索引期即可打通。
+const CONCEPT_ALIAS = {
+  // 设计 / 界面 / 前端
+  '设计': 'design', 'design': 'design', 'designer': 'design', '界面': 'ui', 'ui': 'ui', 'ux': 'ux', '用户界面': 'ui',
+  '前端': 'frontend', 'frontend': 'frontend', 'front-end': 'frontend',
+  '桌面': 'desktop', 'desktop': 'desktop', '网页': 'web', 'web': 'web', '网站': 'web', '页面': 'page', 'page': 'page',
+  '应用': 'app', 'app': 'app', 'application': 'app',
+  // 开发
+  '开发': 'develop', 'develop': 'develop', 'development': 'develop', 'developer': 'develop',
+  '构建': 'build', 'build': 'build', '代码': 'code', 'code': 'code', '编码': 'code', '编程': 'code',
+  '程序': 'program', 'program': 'program', '后端': 'backend', 'backend': 'backend', 'back-end': 'backend',
+  '接口': 'api', 'api': 'api', '工具': 'tool', 'tool': 'tool',
+  // 量化 / 交易 / 金融
+  '量化': 'quant', 'quant': 'quant', 'quantitative': 'quant',
+  '交易': 'trading', 'trading': 'trading', 'trade': 'trading',
+  '回测': 'backtest', 'backtest': 'backtest', 'backtesting': 'backtest',
+  '股票': 'stock', 'stock': 'stock', 'stocks': 'stock', '基金': 'fund', 'fund': 'fund',
+  '黄金': 'gold', 'gold': 'gold', '行情': 'quote', 'quote': 'quote', '市场': 'market', 'market': 'market',
+  // 文档 / 创作
+  '文档': 'document', 'document': 'document', 'doc': 'document', '写作': 'writing', 'writing': 'writing',
+  '报告': 'report', 'report': 'report', '论文': 'paper', 'paper': 'paper',
+  '演示': 'slides', 'slides': 'slides', 'ppt': 'slides', 'pptx': 'slides', '幻灯片': 'slides',
+  '演讲': 'speech', 'speech': 'speech', '直播': 'livestream', 'livestream': 'livestream',
+  // 数据 / 分析
+  '数据': 'data', 'data': 'data', '分析': 'analysis', 'analysis': 'analysis', 'analytics': 'analysis',
+  '图表': 'chart', 'chart': 'chart', '可视化': 'visualization', 'visualization': 'visualization',
+  // 多媒体
+  '图片': 'image', 'image': 'image', '图像': 'image', '视频': 'video', 'video': 'video',
+  '音频': 'audio', 'audio': 'audio', '音乐': 'music', 'music': 'music',
+  '头像': 'avatar', 'avatar': 'avatar', '截图': 'screenshot', 'screenshot': 'screenshot',
+  // 通用
+  '搜索': 'search', 'search': 'search', '翻译': 'translate', 'translate': 'translate', 'translation': 'translate',
+  '邮件': 'email', 'email': 'email', 'mail': 'email', '简历': 'resume', 'resume': 'resume',
+  '笔记': 'note', 'note': 'note', 'notes': 'note', '记忆': 'memory', 'memory': 'memory',
+  '测试': 'test', 'test': 'test', 'testing': 'test', '部署': 'deploy', 'deploy': 'deploy', 'deployment': 'deploy',
+  '安全': 'security', 'security': 'security', '加密': 'encrypt', 'encrypt': 'encrypt', 'encryption': 'encrypt',
+  '密码': 'password', 'password': 'password', '登录': 'login', 'login': 'login', '注册': 'register', 'register': 'register',
+  '数据库': 'database', 'database': 'database', 'db': 'database', '服务器': 'server', 'server': 'server',
+  '网络': 'network', 'network': 'network', '模型': 'model', 'model': 'model', '学习': 'learning', 'learning': 'learning',
+  '训练': 'train', 'train': 'train', 'training': 'train',
+  '教育': 'education', 'education': 'education', '助手': 'assistant', 'assistant': 'assistant',
+  '机器人': 'bot', 'bot': 'bot', 'robot': 'bot', '生成': 'generate', 'generate': 'generate', 'generation': 'generate',
+  '创建': 'create', 'create': 'create', '编辑': 'edit', 'edit': 'edit', 'editing': 'edit',
+  '下载': 'download', 'download': 'download', '上传': 'upload', 'upload': 'upload', '分享': 'share', 'share': 'share',
+  // 情绪 / 心理（领域黑话，一词多义才需手工）
+  '内耗': 'anxiety', '焦虑': 'anxiety', 'anxiety': 'anxiety', '焦虑症': 'anxiety',
+  '情绪': 'emotion', 'emotion': 'emotion', '情绪化': 'emotion', '纠结': 'anxiety', '担心': 'anxiety', '害怕': 'anxiety',
+  '心态': 'mindset', 'mindset': 'mindset', '自卑': 'self-esteem', 'self-esteem': 'self-esteem', '自信': 'self-esteem',
+  '原生家庭': 'family', '家庭': 'family', 'family': 'family',
+};
+
+function canonize(term) {
+  return CONCEPT_ALIAS[term] || term;
+}
+
+/** 原始分词：英文词 + 中文 2-gram（过停用字/停用 bigram）。返回去重后的 string[]。 */
+export function rawTokenize(text) {
+  if (!text) return [];
+  const lower = String(text).toLowerCase();
+  const tokens = new Set();
+  for (const m of lower.matchAll(/[a-z0-9_]+/g)) tokens.add(m[0]);
+  const cjk = lower.match(/[\u4e00-\u9fff]+/g) || [];
+  for (const run of cjk) {
+    for (let i = 0; i + 1 < run.length; i++) {
+      const bg = run.slice(i, i + 2);
+      if (CJK_STOP_CHARS.has(bg[0]) || CJK_STOP_CHARS.has(bg[1])) continue;
+      if (CJK_STOP_BIGRAMS.has(bg)) continue;
+      tokens.add(bg);
+    }
+  }
+  return [...tokens].filter(Boolean);
+}
+
+/** 查询侧分析：token 带 weight + type，防止扩词漂移（设计==design 强，设计~ux 弱）。 */
+export function analyzeQuery(query) {
+  const raw = rawTokenize(query);
+  const out = new Map(); // term -> {weight, type}
+  for (const t of raw) {
+    const c = canonize(t);
+    // 原词（exact 召回，权重最高）
+    const cur = out.get(t);
+    if (!cur || cur.weight < 1.0) out.set(t, { weight: 1.0, type: 'original' });
+    // canonical（alias 召回）
+    if (c !== t) {
+      const curc = out.get(c);
+      if (!curc || curc.weight < 0.9) out.set(c, { weight: 0.9, type: 'alias' });
+    }
+  }
+  return [...out.entries()].map(([term, meta]) => ({ term, ...meta }));
+}
+
+/** 索引侧：entry → 搜索词集合（含 concept 扩展，name/tag/desc 全字段）。 */
+function entryTerms(entry) {
+  const name = (entry.name || '').toLowerCase();
+  const desc = (entry.description || '').toLowerCase();
+  const tags = (entry.tags || []).map((t) => String(t).toLowerCase()).join(' ');
+  const terms = new Set();
+  const add = (tok) => {
+    terms.add(tok);
+    const c = canonize(tok);
+    if (c !== tok) terms.add(c);
+  };
+  for (const t of rawTokenize(name)) add(t);
+  for (const t of rawTokenize(desc)) add(t);
+  for (const t of rawTokenize(tags)) add(t);
+  return terms;
+}
+
+/** 给索引附加检索统计：每个条目的 _t 搜索词 + 全局 IDF / 文档数 / 平均描述长度。 */
+function attachStats(skills, experts) {
+  const s2 = skills.map((e) => ({ ...e, _t: entryTerms(e) }));
+  const e2 = experts.map((e) => ({ ...e, _t: entryTerms(e) }));
+  const df = Object.create(null); // 普通对象（可 JSON 序列化，缓存命中后 idf 仍可用）
+  let totalLen = 0;
+  for (const d of [...s2, ...e2]) {
+    const seen = new Set();
+    totalLen += (d.description || '').length;
+    for (const t of d._t) {
+      if (!seen.has(t)) { seen.add(t); df[t] = (df[t] || 0) + 1; }
+    }
+    delete d._t; // _t(Set) 不可序列化，用完即弃，避免写进缓存
+  }
+  const n = s2.length + e2.length;
+  return { skills: s2, experts: e2, _df: df, _n: n, _avgdl: n ? totalLen / n : 1 };
+}
+
+function idf(term, stats) {
+  const df = stats._df[term] || 0;
+  return Math.log(1 + stats._n / (1 + df));
+}
+
+/** 词边界匹配：英文 token 用 \b 边界（避免 "remotion" 误含 "emotion"），中文 token 用 substring。 */
+function hasWord(text, token) {
+  if (!token) return false;
+  if (/^[a-z0-9_]+$/.test(token)) {
+    return new RegExp(`\\b${token}\\b`, 'i').test(text);
+  }
+  return text.includes(token);
+}
+
+/** 词边界计数（英文用 \b，中文用 substring）。 */
+function countWord(hay, token) {
+  if (!token) return 0;
+  if (/^[a-z0-9_]+$/.test(token)) {
+    const m = hay.match(new RegExp(`\\b${token}\\b`, 'gi'));
+    return m ? m.length : 0;
+  }
+  let n = 0, i = 0;
+  while ((i = hay.indexOf(token, i)) !== -1) { n++; i += token.length; }
+  return n;
+}
+
+function scoreEntry(entry, weightedTokens, stats) {
+  const w = loadConfig().scoring;
+  const name = (entry.name || '').toLowerCase();
+  const desc = (entry.description || '').toLowerCase();
+  const tags = (entry.tags || []).map((t) => String(t).toLowerCase());
+  let score = 0;
+  const matched = new Set();
+  for (const wt of weightedTokens) {
+    const t = wt.term;
+    if (!t) continue;
+    const wv = wt.weight;
+    const idfv = idf(t, stats);
+    // 三路召回：name 精确 > name 包含 > tag > desc（字段权重递减）
+    if (name === t) { score += wv * idfv * w.nameExact; matched.add(t); }
+    else if (hasWord(name, t)) { score += wv * idfv * w.namePartial; matched.add(t); }
+    if (tags.some((tag) => tag === t || hasWord(tag, t))) { score += wv * idfv * w.tag; matched.add(t); }
+    const tf = countWord(desc, t);
+    if (tf > 0) {
+      const norm = Math.min(tf, w.descCap) / Math.pow(1 + desc.length / Math.max(stats._avgdl, 1), w.lengthB);
+      score += wv * idfv * w.desc * norm;
+      matched.add(t);
+    }
+  }
+  return { score, matched: [...matched] };
+}
+
+function buildReason(e, matched) {
+  const name = (e.name || e.id || '').toLowerCase();
+  const parts = [];
+  for (const t of matched.slice(0, 8)) {
+    if (name === t) parts.push(`名称命中"${t}"`);
+    else if (hasWord(name, t)) parts.push(`名称含"${t}"`);
+    else parts.push(`相关词"${t}"`);
+  }
+  const src = e.source === 'local' ? '已装' : (e.source === 'marketplace' ? '市场' : '开源');
+  return `${src}；` + (parts.slice(0, 3).join('、') || '关键词相关');
+}
+
+const DECISION_SIGNALS = ['怎么办', '该不该', '要不要', '会不会', '是不是', '好烦', '纠结', '犹豫', '担心', '焦虑', '怕', '万一', '帮帮我', '害怕'];
+
+/** 轻量意图识别：决策/情绪 → decision；开发/构建 → build；操作步骤 → howto；解释 → explain；默认 general。 */
+export function detectIntent(query) {
+  const q = String(query || '');
+  if (DECISION_SIGNALS.some((s) => q.includes(s))) return 'decision';
+  if (/做一个|做出|开发|构建|搭建|实现|写一个|创建|design|build|create|develop|make/i.test(q)) return 'build';
+  if (/怎么用|怎么操作|步骤|教程|怎么弄|怎么做|流程/.test(q)) return 'howto';
+  if (/是什么|什么意思|为什么|区别|原理/.test(q)) return 'explain';
+  return 'general';
+}
+
+/** 相关度接近（差 < tieEps）时，本地已装优先；否则纯按相关度。已装不再进相关度公式。 */
+function rankWithTiebreak(list) {
+  const eps = loadConfig().scoring.tieEps;
+  const SOURCE_ORDER = { local: 0, marketplace: 1, opensource: 2 };
+  list.sort((a, b) => {
+    const d = b.score - a.score;
+    if (Math.abs(d) < eps) return (SOURCE_ORDER[a.source] ?? 9) - (SOURCE_ORDER[b.source] ?? 9);
+    return d;
+  });
+  return list;
+}
+
+/** 分池召回：skills / experts 分开打分排序，返回 { skills, experts, intent }。 */
+export function match(query, index, { candidateK, includeExperts = true } = {}) {
+  loadConfig();
+  const k = candidateK ?? loadConfig().match.candidateK;
+  const qTokens = analyzeQuery(query);
+  if (qTokens.length === 0) return { skills: [], experts: [], intent: detectIntent(query) };
+  const stats = index._df ? index : attachStats(index.skills, index.experts);
+  const scorePool = (list) => list
+    .map((e) => {
+      const r = scoreEntry(e, qTokens, stats);
+      return { ...e, score: r.score, matched: r.matched, reason: buildReason(e, r.matched) };
+    })
+    .filter((e) => e.score > 0);
+  let skills = scorePool(stats.skills);
+  let experts = includeExperts ? scorePool(stats.experts) : [];
+  skills = rankWithTiebreak(skills);
+  experts = rankWithTiebreak(experts);
+  return { skills: skills.slice(0, k), experts: experts.slice(0, k), intent: detectIntent(query) };
 }
 
 // ---------- cache ----------
@@ -408,135 +718,49 @@ function writeCache(data) {
   } catch { /* ignore */ }
 }
 
+export function buildIndex(cwd, { offline = false } = {}) {
+  loadConfig();
+  const { items: skillsAuto, localIds } = collectSkills(cwd);
+  const remote = fetchRemoteSkillsSync(offline);
+  for (const r of remote) if (!skillsAuto.find((s) => s.id === r.id)) skillsAuto.push(r);
+  const skills = mergeByPriority(skillsAuto, SEED_OPENSOURCE);
+  const expertsAuto = collectExperts(cwd);
+  const expertIds = new Set(expertsAuto.map((e) => e.id));
+  const skillsFinal = skills.filter((s) => !expertIds.has(s.id));
+  return attachStats(dedupeByName(skillsFinal), expertsAuto);
+}
+
+// fetchRemoteSkills is async; provide a sync wrapper for buildIndex convenience.
+function fetchRemoteSkillsSync(offline) {
+  if (offline) return [];
+  return [];
+}
+
 export async function getIndex({ cwd, offline = false } = {}) {
   const now = Date.now();
   if (offline) {
     const idx = buildIndex(cwd, { offline: true });
-    return { ...idx, builtAt: now, offline: true };
+    return { ...idx, builtAt: now, offline: true, localFp: computeLocalFingerprint(cwd) };
   }
-  if (_memCache && now - _memCache.builtAt < FRESH_MS) return _memCache;
+  const fp = computeLocalFingerprint(cwd);
+  if (_memCache && now - _memCache.builtAt < FRESH_MS && _memCache.localFp === fp) return _memCache;
   const fileCache = readCache();
-  if (fileCache && now - fileCache.builtAt < FRESH_MS) { _memCache = fileCache; return fileCache; }
+  if (fileCache && now - fileCache.builtAt < FRESH_MS && fileCache.localFp === fp) {
+    _memCache = fileCache;
+    return fileCache;
+  }
   const idx = buildIndex(cwd, { offline: false });
-  // fill remote at async time
   const remote = await fetchRemoteSkills(false);
   const merged = mergeByPriority(idx.skills, remote.length ? remote : SEED_OPENSOURCE);
   const expertIds = new Set(idx.experts.map((e) => e.id));
   const finalSkills = dedupeByName(merged.filter((s) => !expertIds.has(s.id)));
+  const stats = attachStats(finalSkills, idx.experts);
   const prev = readCache() || {};
-  const wrapped = { skills: finalSkills, experts: idx.experts, builtAt: now, offline: false,
+  const wrapped = { ...stats, builtAt: now, offline: false, localFp: fp,
     remoteHashes: prev.remoteHashes || {} };
   _memCache = wrapped;
   writeCache(wrapped);
   return wrapped;
-}
-
-// ---------- 5. matching (L0/L1 keyword recall + intent hint) ----------
-
-// 中文停用字/词：过滤"个/要/需要"这类无信息量的 token，避免无关条目靠虚词得分。
-const CJK_STOP_CHARS = new Set(['的', '了', '我', '你', '他', '她', '它', '个', '要', '需', '想', '是', '和', '与',
-  '或', '在', '也', '就', '都', '吗', '呢', '吧', '啊', '么', '很', '做', '用', '有', '没', '不', '给', '让', '请', '帮', '好', '会', '能']);
-const CJK_STOP_BIGRAMS = new Set(['需要', '可以', '能够', '我们', '你们', '他们', '这个', '那个', '什么', '怎么',
-  '为什么', '如何', '一个', '一些', '这种', '这样', '那样', '就是', '不是', '还有', '自己', '事情', '东西',
-  '问题', '时候', '现在', '已经', '一直', '真的', '其实', '但是', '因为', '所以', '如果', '然后', '知道',
-  '想要', '希望', '应该', '可能', '觉得', '想要', '帮我', '请问']);
-
-// 中英近义映射：本地技能描述多为英文，中文查询需补英文等价 token 才能召回。
-const ZH_EN_MAP = {
-  '设计': 'design', '开发': 'develop', '界面': 'ui', '应用': 'app', '程序': 'program', '前端': 'frontend',
-  '后端': 'backend', '桌面': 'desktop', '网页': 'web', '页面': 'page', '图片': 'image', '视频': 'video',
-  '音频': 'audio', '音乐': 'music', '文档': 'document', '数据': 'data', '分析': 'analysis', '图表': 'chart',
-  '搜索': 'search', '翻译': 'translate', '邮件': 'email', '简历': 'resume', '报告': 'report', '测试': 'test',
-  '部署': 'deploy', '笔记': 'note', '记忆': 'memory', '量化': 'quant', '交易': 'trading', '股票': 'stock',
-  '基金': 'fund', '黄金': 'gold', '行情': 'quote', '回测': 'backtest', '论文': 'paper', '写作': 'writing',
-  '演讲': 'speech', '直播': 'livestream', '短视频': 'video', '头像': 'avatar', '截图': 'screenshot',
-  '代码': 'code', '接口': 'api', '数据库': 'database', '服务器': 'server', '网络': 'network', '安全': 'security',
-  '加密': 'encrypt', '密码': 'password', '登录': 'login', '注册': 'register', '分享': 'share', '下载': 'download',
-  '上传': 'upload', '编辑': 'edit', '生成': 'generate', '创建': 'create', '构建': 'build', '工具': 'tool',
-  '助手': 'assistant', '机器人': 'robot', '模型': 'model', '训练': 'train', '学习': 'learning', '教育': 'education',
-};
-
-export function tokenize(text) {
-  if (!text) return [];
-  const lower = String(text).toLowerCase();
-  const tokens = new Set();
-  for (const m of lower.matchAll(/[a-z0-9_]+/g)) tokens.add(m[0]);
-  const cjk = lower.match(/[\u4e00-\u9fff]+/g) || [];
-  for (const run of cjk) {
-    for (let i = 0; i + 1 < run.length; i++) {
-      const bg = run.slice(i, i + 2);
-      // 2-gram，跳过含停用字的虚词组合与常见无信息 bigram
-      if (CJK_STOP_CHARS.has(bg[0]) || CJK_STOP_CHARS.has(bg[1])) continue;
-      if (CJK_STOP_BIGRAMS.has(bg)) continue;
-      tokens.add(bg);
-    }
-  }
-  // 中英近义扩充：给映射表内的中文 token 补英文等价 token
-  const extra = new Set();
-  for (const t of tokens) {
-    const en = ZH_EN_MAP[t];
-    if (en) extra.add(en);
-  }
-  return [...tokens, ...extra].filter(Boolean);
-}
-
-function scoreEntry(entry, tokens) {
-  let score = 0;
-  const name = (entry.name || entry.id || '').toLowerCase();
-  const desc = (entry.description || '').toLowerCase();
-  const tags = (entry.tags || []).join(' ').toLowerCase();
-  const matched = new Set();
-  for (const t of tokens) {
-    if (!t) continue;
-    if (name === t) { score += 8; matched.add(t); }
-    else if (name.includes(t)) { score += 6; matched.add(t); }
-    if (tags.includes(t)) { score += 4; matched.add(t); }
-    const n = desc.split(t).length - 1; // 描述词频，封顶 ×3，让语义接近的明显领先
-    if (n > 0) { score += 2 * Math.min(n, 3); matched.add(t); }
-  }
-  if (desc.length >= 40) score += 1;
-  // 已装技能加权：同等匹配度下本地已装优先（用户最常要"在已装里挑一个"）
-  if (entry.source === 'local') score = Math.round(score * 1.2) + 2;
-  return { score, matched: [...matched] };
-}
-
-function buildReason(e, matched) {
-  const parts = [];
-  const name = (e.name || e.id || '').toLowerCase();
-  const desc = (e.description || '').toLowerCase();
-  for (const t of matched) {
-    if (name === t) parts.push(`名称完全命中"${t}"`);
-    else if (name.includes(t)) parts.push(`名称含"${t}"`);
-    else if (desc.includes(t)) parts.push(`描述含"${t}"`);
-  }
-  const src = e.source === 'local' ? '已装' : (e.source === 'marketplace' ? '市场' : '开源');
-  return `${src}；` + (parts.slice(0, 3).join('、') || '关键词相关');
-}
-
-const DECISION_SIGNALS = ['怎么办', '该不该', '要不要', '会不会', '是不是', '好烦', '纠结', '犹豫', '担心', '焦虑', '怕', '万一', '帮帮我', '害怕'];
-
-/** 轻量意图识别：决策/情绪 → decision；开发/构建 → build；操作步骤 → howto；解释 → explain；默认 general。 */
-export function detectIntent(query) {
-  const q = String(query || '');
-  if (DECISION_SIGNALS.some((s) => q.includes(s))) return 'decision';
-  if (/做一个|做出|开发|构建|搭建|实现|写一个|创建|design|build|create|develop|make/i.test(q)) return 'build';
-  if (/怎么用|怎么操作|步骤|教程|怎么弄|怎么做|流程/.test(q)) return 'howto';
-  if (/是什么|什么意思|为什么|区别|原理/.test(q)) return 'explain';
-  return 'general';
-}
-
-export function match(query, index, { topN = 5, includeExperts = true } = {}) {
-  const tokens = tokenize(query);
-  if (tokens.length === 0) return [];
-  let pool = index.skills;
-  if (includeExperts) pool = pool.concat(index.experts);
-  const scored = [];
-  for (const e of pool) {
-    const { score, matched } = scoreEntry(e, tokens);
-    if (score > 0) scored.push({ ...e, score, matched, reason: buildReason(e, matched) });
-  }
-  scored.sort((a, b) => b.score - a.score);
-  return scored.slice(0, topN);
 }
 
 export { SENSITIVE_KEYWORDS, HOME, CACHE_DIR };
