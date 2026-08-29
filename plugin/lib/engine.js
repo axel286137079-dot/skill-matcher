@@ -81,12 +81,33 @@ export function discoverSkillDirs(cwd) {
     join(HOME, '.workbuddy', 'skills'),
     join(HOME, '.claude', 'skills'),
     join(HOME, '.codebuddy', 'skills'),
+    join(HOME, '.dsh', 'skills'),     // DSH 用户技能根（user-dsh 源）
+    join(HOME, '.agents', 'skills'),  // DSH agent 技能目录（带版本后缀，如 ui-ux-pro-max-0.1.0）
     join(HOME, '.skills'),
   );
   for (const root of [cwd, process.cwd()]) {
-    if (root) cands.push(join(root, '.workbuddy', 'skills'));
+    if (root) {
+      cands.push(join(root, '.workbuddy', 'skills'));
+      cands.push(join(root, '.dsh', 'skills'));
+      cands.push(join(root, '.agents', 'skills'));
+    }
   }
   return dedupeDirs(cands);
+}
+
+/** WorkBuddy/CodeBuddy 官方内置技能目录（已装可用，不算市场未装）。 */
+export function discoverBuiltinSkillDirs() {
+  const cands = [];
+  for (const mp of [join(HOME, '.workbuddy', 'plugins', 'marketplaces'),
+                    join(HOME, '.codebuddy', 'plugins', 'marketplaces')]) {
+    cands.push(join(mp, 'codebuddy-plugins-official', 'plugins'));
+  }
+  return dedupeDirs(cands);
+}
+
+/** 剥离技能目录名末尾的版本号后缀（如 ui-ux-pro-max-0.1.0 → ui-ux-pro-max）。 */
+function stripVersionSuffix(name) {
+  return name.replace(/-\d+\.\d+(\.\d+)?$/, '');
 }
 
 export function discoverExpertRoots(cwd) {
@@ -158,6 +179,7 @@ function globFiles(parent, relPattern) {
 export function collectSkills(cwd) {
   const items = [];
   const localIds = new Set();
+  // 本地已装技能（常规技能目录 + DSH agent 目录，目录名可能带版本后缀）
   for (const sd of discoverSkillDirs(cwd)) {
     if (!existsSync(sd)) continue;
     for (const entry of readdirSync(sd)) {
@@ -166,9 +188,34 @@ export function collectSkills(cwd) {
       try {
         const parsed = parseSkillFrontmatter(readFileSync(skmd, 'utf8'));
         if (!parsed) continue;
-        localIds.add(entry);
+        const id = stripVersionSuffix(entry);
+        localIds.add(id);
         items.push({
-          id: entry,
+          id,
+          name: parsed.name,
+          description: parsed.description,
+          install: null,
+          source: 'local',
+          kind: 'skill',
+          tags: [],
+        });
+      } catch { /* ignore */ }
+    }
+  }
+  // 官方内置技能（codebuddy-plugins-official/plugins/*/SKILL.md，已装可用，非市场未装）
+  for (const bd of discoverBuiltinSkillDirs()) {
+    if (!existsSync(bd)) continue;
+    for (const entry of readdirSync(bd)) {
+      const skmd = join(bd, entry, 'SKILL.md');
+      if (!existsSync(skmd)) continue;
+      try {
+        const parsed = parseSkillFrontmatter(readFileSync(skmd, 'utf8'));
+        if (!parsed) continue;
+        const id = stripVersionSuffix(entry);
+        if (localIds.has(id)) continue; // 已被常规目录收录则不重复
+        localIds.add(id);
+        items.push({
+          id,
           name: parsed.name,
           description: parsed.description,
           install: null,
@@ -394,6 +441,21 @@ const CJK_STOP_BIGRAMS = new Set(['需要', '可以', '能够', '我们', '你�
   '问题', '时候', '现在', '已经', '一直', '真的', '其实', '但是', '因为', '所以', '如果', '然后', '知道',
   '想要', '希望', '应该', '可能', '觉得', '想要', '帮我', '请问']);
 
+// 中英近义映射：本地技能描述多为英文，中文查询需补英文等价 token 才能召回。
+const ZH_EN_MAP = {
+  '设计': 'design', '开发': 'develop', '界面': 'ui', '应用': 'app', '程序': 'program', '前端': 'frontend',
+  '后端': 'backend', '桌面': 'desktop', '网页': 'web', '页面': 'page', '图片': 'image', '视频': 'video',
+  '音频': 'audio', '音乐': 'music', '文档': 'document', '数据': 'data', '分析': 'analysis', '图表': 'chart',
+  '搜索': 'search', '翻译': 'translate', '邮件': 'email', '简历': 'resume', '报告': 'report', '测试': 'test',
+  '部署': 'deploy', '笔记': 'note', '记忆': 'memory', '量化': 'quant', '交易': 'trading', '股票': 'stock',
+  '基金': 'fund', '黄金': 'gold', '行情': 'quote', '回测': 'backtest', '论文': 'paper', '写作': 'writing',
+  '演讲': 'speech', '直播': 'livestream', '短视频': 'video', '头像': 'avatar', '截图': 'screenshot',
+  '代码': 'code', '接口': 'api', '数据库': 'database', '服务器': 'server', '网络': 'network', '安全': 'security',
+  '加密': 'encrypt', '密码': 'password', '登录': 'login', '注册': 'register', '分享': 'share', '下载': 'download',
+  '上传': 'upload', '编辑': 'edit', '生成': 'generate', '创建': 'create', '构建': 'build', '工具': 'tool',
+  '助手': 'assistant', '机器人': 'robot', '模型': 'model', '训练': 'train', '学习': 'learning', '教育': 'education',
+};
+
 export function tokenize(text) {
   if (!text) return [];
   const lower = String(text).toLowerCase();
@@ -409,7 +471,13 @@ export function tokenize(text) {
       tokens.add(bg);
     }
   }
-  return [...tokens].filter(Boolean);
+  // 中英近义扩充：给映射表内的中文 token 补英文等价 token
+  const extra = new Set();
+  for (const t of tokens) {
+    const en = ZH_EN_MAP[t];
+    if (en) extra.add(en);
+  }
+  return [...tokens, ...extra].filter(Boolean);
 }
 
 function scoreEntry(entry, tokens) {
@@ -447,10 +515,11 @@ function buildReason(e, matched) {
 
 const DECISION_SIGNALS = ['怎么办', '该不该', '要不要', '会不会', '是不是', '好烦', '纠结', '犹豫', '担心', '焦虑', '怕', '万一', '帮帮我', '害怕'];
 
-/** 轻量意图识别：决策/情绪 → decision；操作步骤 → howto；解释 → explain；默认 general。 */
+/** 轻量意图识别：决策/情绪 → decision；开发/构建 → build；操作步骤 → howto；解释 → explain；默认 general。 */
 export function detectIntent(query) {
   const q = String(query || '');
   if (DECISION_SIGNALS.some((s) => q.includes(s))) return 'decision';
+  if (/做一个|做出|开发|构建|搭建|实现|写一个|创建|design|build|create|develop|make/i.test(q)) return 'build';
   if (/怎么用|怎么操作|步骤|教程|怎么弄|怎么做|流程/.test(q)) return 'howto';
   if (/是什么|什么意思|为什么|区别|原理/.test(q)) return 'explain';
   return 'general';
