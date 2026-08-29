@@ -306,6 +306,19 @@ export function mergeByPriority(auto, manual) {
   return [...merged.values()];
 }
 
+/** 同名去重：同一技能可能装于多环境（如 skill-matcher 与 skill-matcher__skillhub），
+ *  优先保留 id === name 的规范条目，避免列表里出现两条同名。 */
+export function dedupeByName(items) {
+  const byName = new Map();
+  for (const s of items) {
+    const key = s.name || s.id;
+    const cur = byName.get(key);
+    if (!cur) byName.set(key, s);
+    else if (cur.id !== cur.name && s.id === s.name) byName.set(key, s);
+  }
+  return [...byName.values()];
+}
+
 export function buildIndex(cwd, { offline = false } = {}) {
   const { items: skillsAuto, localIds } = collectSkills(cwd);
   const remote = fetchRemoteSkillsSync(offline);
@@ -316,7 +329,7 @@ export function buildIndex(cwd, { offline = false } = {}) {
   // experts never enter the skill list
   const expertIds = new Set(experts.map((e) => e.id));
   const skillsFinal = skills.filter((s) => !expertIds.has(s.id));
-  return { skills: skillsFinal, experts };
+  return { skills: dedupeByName(skillsFinal), experts };
 }
 
 // fetchRemoteSkills is async; provide a sync wrapper for buildIndex convenience.
@@ -362,7 +375,7 @@ export async function getIndex({ cwd, offline = false } = {}) {
   const remote = await fetchRemoteSkills(false);
   const merged = mergeByPriority(idx.skills, remote.length ? remote : SEED_OPENSOURCE);
   const expertIds = new Set(idx.experts.map((e) => e.id));
-  const finalSkills = merged.filter((s) => !expertIds.has(s.id));
+  const finalSkills = dedupeByName(merged.filter((s) => !expertIds.has(s.id)));
   const prev = readCache() || {};
   const wrapped = { skills: finalSkills, experts: idx.experts, builtAt: now, offline: false,
     remoteHashes: prev.remoteHashes || {} };
@@ -371,18 +384,29 @@ export async function getIndex({ cwd, offline = false } = {}) {
   return wrapped;
 }
 
-// ---------- 5. matching (L0/L1 keyword recall) ----------
+// ---------- 5. matching (L0/L1 keyword recall + intent hint) ----------
+
+// 中文停用字/词：过滤"个/要/需要"这类无信息量的 token，避免无关条目靠虚词得分。
+const CJK_STOP_CHARS = new Set(['的', '了', '我', '你', '他', '她', '它', '个', '要', '需', '想', '是', '和', '与',
+  '或', '在', '也', '就', '都', '吗', '呢', '吧', '啊', '么', '很', '做', '用', '有', '没', '不', '给', '让', '请', '帮', '好', '会', '能']);
+const CJK_STOP_BIGRAMS = new Set(['需要', '可以', '能够', '我们', '你们', '他们', '这个', '那个', '什么', '怎么',
+  '为什么', '如何', '一个', '一些', '这种', '这样', '那样', '就是', '不是', '还有', '自己', '事情', '东西',
+  '问题', '时候', '现在', '已经', '一直', '真的', '其实', '但是', '因为', '所以', '如果', '然后', '知道',
+  '想要', '希望', '应该', '可能', '觉得', '想要', '帮我', '请问']);
 
 export function tokenize(text) {
   if (!text) return [];
   const lower = String(text).toLowerCase();
   const tokens = new Set();
   for (const m of lower.matchAll(/[a-z0-9_]+/g)) tokens.add(m[0]);
-  const cjk = lower.match(/[一-鿿]+/g) || [];
+  const cjk = lower.match(/[\u4e00-\u9fff]+/g) || [];
   for (const run of cjk) {
-    for (let i = 0; i < run.length; i++) {
-      tokens.add(run[i]);
-      if (i + 1 < run.length) tokens.add(run.slice(i, i + 2));
+    for (let i = 0; i + 1 < run.length; i++) {
+      const bg = run.slice(i, i + 2);
+      // 2-gram，跳过含停用字的虚词组合与常见无信息 bigram
+      if (CJK_STOP_CHARS.has(bg[0]) || CJK_STOP_CHARS.has(bg[1])) continue;
+      if (CJK_STOP_BIGRAMS.has(bg)) continue;
+      tokens.add(bg);
     }
   }
   return [...tokens].filter(Boolean);
@@ -396,13 +420,40 @@ function scoreEntry(entry, tokens) {
   const matched = new Set();
   for (const t of tokens) {
     if (!t) continue;
-    if (name.includes(t)) { score += 5; matched.add(t); }
-    if (name === t) score += 8;
-    if (desc.includes(t)) { score += 2; matched.add(t); }
-    if (tags.includes(t)) { score += 3; matched.add(t); }
+    if (name === t) { score += 8; matched.add(t); }
+    else if (name.includes(t)) { score += 6; matched.add(t); }
+    if (tags.includes(t)) { score += 4; matched.add(t); }
+    const n = desc.split(t).length - 1; // 描述词频，封顶 ×3，让语义接近的明显领先
+    if (n > 0) { score += 2 * Math.min(n, 3); matched.add(t); }
   }
   if (desc.length >= 40) score += 1;
+  // 已装技能加权：同等匹配度下本地已装优先（用户最常要"在已装里挑一个"）
+  if (entry.source === 'local') score = Math.round(score * 1.2) + 2;
   return { score, matched: [...matched] };
+}
+
+function buildReason(e, matched) {
+  const parts = [];
+  const name = (e.name || e.id || '').toLowerCase();
+  const desc = (e.description || '').toLowerCase();
+  for (const t of matched) {
+    if (name === t) parts.push(`名称完全命中"${t}"`);
+    else if (name.includes(t)) parts.push(`名称含"${t}"`);
+    else if (desc.includes(t)) parts.push(`描述含"${t}"`);
+  }
+  const src = e.source === 'local' ? '已装' : (e.source === 'marketplace' ? '市场' : '开源');
+  return `${src}；` + (parts.slice(0, 3).join('、') || '关键词相关');
+}
+
+const DECISION_SIGNALS = ['怎么办', '该不该', '要不要', '会不会', '是不是', '好烦', '纠结', '犹豫', '担心', '焦虑', '怕', '万一', '帮帮我', '害怕'];
+
+/** 轻量意图识别：决策/情绪 → decision；操作步骤 → howto；解释 → explain；默认 general。 */
+export function detectIntent(query) {
+  const q = String(query || '');
+  if (DECISION_SIGNALS.some((s) => q.includes(s))) return 'decision';
+  if (/怎么用|怎么操作|步骤|教程|怎么弄|怎么做|流程/.test(q)) return 'howto';
+  if (/是什么|什么意思|为什么|区别|原理/.test(q)) return 'explain';
+  return 'general';
 }
 
 export function match(query, index, { topN = 5, includeExperts = true } = {}) {
@@ -413,7 +464,7 @@ export function match(query, index, { topN = 5, includeExperts = true } = {}) {
   const scored = [];
   for (const e of pool) {
     const { score, matched } = scoreEntry(e, tokens);
-    if (score > 0) scored.push({ ...e, score, matched });
+    if (score > 0) scored.push({ ...e, score, matched, reason: buildReason(e, matched) });
   }
   scored.sort((a, b) => b.score - a.score);
   return scored.slice(0, topN);
