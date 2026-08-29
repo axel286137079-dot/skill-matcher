@@ -5,7 +5,7 @@ displayName: 技能与专家匹配器
 summary: 读懂需求，从本机技能、市场技能、专家、开源社区中匹配推荐最该用的那一个（Top3 + 理由 + 一键安装）。
 license: MIT
 description: 技能与专家智能匹配器（Skill & Expert Matcher）。读懂用户需求——按字面(L0)、语义(L1)、意图(L2)、潜在需求(L3)四层递进理解，用户可能随口说、模糊说、甚至没直接提问但背后有真实需求；用情绪信号词检测与目标反推挖掘潜在需求，然后从本地已装技能、市场技能、专家目录中自动匹配，输出 Top3 推荐 + 匹配理由 + 一键安装/启用方式。中英双语。当用户表达任何需求、尤其是纠结"该用哪个技能/工具/专家"时触发。
-version: 1.1.3
+version: 1.2.0
 category: 工具效率
 tags: [技能匹配, 专家推荐, 元技能, 技能发现]
 platforms: [workbuddy, claude-code, cursor]
@@ -71,7 +71,11 @@ platforms: [workbuddy, claude-code, cursor]
 1. **保鲜检查**：若 `index/skills.json` / `index/experts.json` 缺失或超过 24 小时未更新，先运行 `python3 bin/sync_index.py`（Bash）。
 2. 用 Read 读取两个索引 JSON（路径相对本技能根目录）。
 3. 按四层理解需求，圈定候选。
-4. 综合「匹配度 + 是否已装 + 用户真实意图」排序，取 Top3：**同等匹配度下本地已装优先**（用户最常要"在已装里挑一个"）；识别到决策/情绪信号（怎么办/该不该/好烦/焦虑/纠结…）时，优先决策/风控/心理支持类能力。
+4. 分池召回与排序（技能 / 专家分开，各自按匹配度排）：
+   - **跨语言归一到概念**：把中英文近义词归一到同一概念（设计/design、界面/ui、量化/quant、回测/backtest…），中文查询也能命中英文描述的技能。
+   - **区分度（IDF）**：越稀有的词越能定位（"黄金/回测"比"工具/开发"更有区分力），通用虚词（的/了/需要…）与英文子串不参与打分。
+   - **排序纪律**：匹配度优先；**仅在匹配度非常接近时**本地已装排前（不把"已装"硬塞进相关度公式）。技能与专家分池，不互相抢位。
+   - **召回面**：先圈出 12~20 个候选，再从中挑最该用的 Top3（宁可多召不漏——对的排到第 7 名，LLM 再聪明也救不回）。
 5. 按下方格式输出。
 
 ## 匹配即安装（一键闭环 + 安全护栏）
@@ -82,10 +86,7 @@ platforms: [workbuddy, claude-code, cursor]
 - `source=local`：已装，跳过。
 - `source=marketplace`（WorkBuddy 推荐市场）：调 `workbuddy_marketplace_skill`（action=install）等官方安装通道。
 - `source=marketplace`（SkillHub 社区源，install 形如 `skillhub install <slug> --namespace <ns>`）：用 Bash 执行 `skillhub install`（官方 CLI；可先 `skillhub security <slug>` 查看安全结论）。
-- `source=opensource`：仅当 install 字段以**可信前缀**开头才自动执行：
-  - `https://github.com/axel286137079-dot/`（本目录官方维护）
-  - `https://github.com/anthropics/`（知名官方技能库）
-  - 白名单外的 GitHub 仓库 → 展示 `git clone` 命令与仓库地址，请用户确认后执行。
+- `source=opensource`：install 若为 `git clone ...`（任何 GitHub 仓库），一律**展示命令与仓库地址、请用户确认后执行**，不自动 clone（防止仓库被接管/重命名导致供应链投毒）。
 
 **自动执行红线**：任何 `curl ... | sh/bash`、`wget` 管道执行、陌生域名脚本、非白名单来源的 install → **一律禁止自动执行**，展示完整命令 + 来源，请用户确认。
 
