@@ -83,11 +83,29 @@ def discover_skill_dirs():
         Path.home() / ".workbuddy" / "skills",
         Path.home() / ".claude" / "skills",
         Path.home() / ".codebuddy" / "skills",
+        Path.home() / ".dsh" / "skills",     # DSH 用户技能根（user-dsh 源）
+        Path.home() / ".agents" / "skills",  # DSH agent 技能目录（带版本后缀）
         Path.home() / ".skills",
     ]
     for root in [Path.cwd(), Path(__file__).resolve().parent.parent.parent]:
         cands.append(root / ".workbuddy" / "skills")
+        cands.append(root / ".dsh" / "skills")
+        cands.append(root / ".agents" / "skills")
     return _dedupe_dirs(cands)
+
+
+def discover_builtin_skill_dirs():
+    """WorkBuddy/CodeBuddy 官方内置技能目录（已装可用，不算市场未装）。"""
+    cands = []
+    for mp in [Path.home() / ".workbuddy" / "plugins" / "marketplaces",
+               Path.home() / ".codebuddy" / "plugins" / "marketplaces"]:
+        cands.append(mp / "codebuddy-plugins-official" / "plugins")
+    return _dedupe_dirs(cands)
+
+
+def strip_version_suffix(name: str) -> str:
+    """剥离技能目录名末尾的版本号后缀（如 ui-ux-pro-max-0.1.0 → ui-ux-pro-max）。"""
+    return re.sub(r"-\d+\.\d+(\.\d+)?$", "", name)
 
 
 def discover_expert_roots():
@@ -134,6 +152,7 @@ def _pick(d, key, lang):
 def collect_skills():
     """返回 (skills, local_ids)：本地已装技能 + 市场未装技能（排除 agents-* 专家）。"""
     items, local_ids = [], set()
+    # 本地已装技能（常规技能目录 + DSH agent 目录，目录名可能带版本后缀）
     for sd in discover_skill_dirs():
         for skmd in sorted(sd.glob("*/SKILL.md")):
             try:
@@ -141,9 +160,31 @@ def collect_skills():
                 if not parsed:
                     continue
                 name, desc = parsed
-                local_ids.add(skmd.parent.name)
+                sid = strip_version_suffix(skmd.parent.name)
+                local_ids.add(sid)
                 items.append({
-                    "id": skmd.parent.name,
+                    "id": sid,
+                    "name": name,
+                    "description": desc,
+                    "install": None,
+                    "source": "local",
+                })
+            except Exception:
+                continue
+    # 官方内置技能（codebuddy-plugins-official/plugins/*/SKILL.md，已装可用）
+    for bd in discover_builtin_skill_dirs():
+        for skmd in sorted(bd.glob("*/SKILL.md")):
+            try:
+                parsed = parse_skill_skmd(skmd)
+                if not parsed:
+                    continue
+                name, desc = parsed
+                sid = strip_version_suffix(skmd.parent.name)
+                if sid in local_ids:
+                    continue
+                local_ids.add(sid)
+                items.append({
+                    "id": sid,
                     "name": name,
                     "description": desc,
                     "install": None,
