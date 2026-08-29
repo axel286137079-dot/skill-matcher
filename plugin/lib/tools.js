@@ -8,7 +8,7 @@
  * is performed by the LLM using these candidates; the tools only do L0/L1 recall + ranking.
  */
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import { getIndex, buildIndex, match, detectIntent, isTrustedInstall, SENSITIVE_KEYWORDS } from './engine.js';
+import { getIndex, buildIndex, match, isTrustedInstall, logQuery, SENSITIVE_KEYWORDS } from './engine.js';
 
 /** One text content block (the only render shape these tools emit). */
 function text(value) {
@@ -80,31 +80,49 @@ export function skillMatcherMatchTool() {
       render: (_a, v) => text(v.text),
     },
     async execute(args, exec) {
-      const topN = Math.min(10, Math.max(1, typeof args.topN === 'number' && Number.isFinite(args.topN) ? Math.floor(args.topN) : 5));
+      const displayN = Math.min(10, Math.max(1, typeof args.topN === 'number' && Number.isFinite(args.topN) ? Math.floor(args.topN) : 5));
       const includeExperts = args.includeExperts !== false;
       const offline = args.offline === true;
       const cwd = args.cwd || cwdOf(exec);
       const idx = offline ? buildIndex(cwd, { offline: true }) : await getIndex({ cwd, offline: false });
-      const intent = detectIntent(args.query);
-      const hits = match(args.query, idx, { topN, includeExperts });
-      if (hits.length === 0) {
+      const { skills, experts, intent } = match(args.query, idx, { candidateK: 15, includeExperts });
+      // 查询日志（默认关，见 config.logging.enabled）
+      logQuery({
+        q: args.query, intent,
+        skills: skills.slice(0, displayN).map((e) => ({ id: e.id, source: e.source, score: +e.score.toFixed(3) })),
+        experts: experts.slice(0, 2).map((e) => ({ id: e.id, source: e.source, score: +e.score.toFixed(3) })),
+      });
+      if (skills.length === 0 && experts.length === 0) {
         return { text: `没有匹配到「${args.query}」的相关技能或专家。可换种说法，或先调用 skill_matcher_list 浏览本机已装能力。` };
       }
       const intentLabel = { decision: '决策/情绪（优先决策·风控·心理支持类）', build: '开发/构建（优先开发·设计·工程类）', howto: '操作步骤', explain: '解释说明', general: '一般' }[intent] || '一般';
-      let out = `匹配「${args.query}」Top ${hits.length}（意图识别：${intentLabel}；已装技能已加权优先）：\n\n`;
-      hits.forEach((e, i) => {
-        const status = e.source === 'local' ? '已装' : (e.source === 'marketplace' ? '市场未装（可装）' : '开源');
-        out += `${i + 1}. ${e.name} ｜ ${e.kind === 'expert' ? '专家' : '技能'} · ${status} · 匹配度 ${e.score}\n`;
-        out += `   匹配理由: ${e.reason}\n`;
-        out += `   说明: ${e.description}\n`;
-        if (e.install) {
-          const trusted = isTrustedInstall(e.install);
-          out += `   安装: ${e.install}${trusted ? '' : '（白名单外，需确认后执行）'}\n`;
-        }
-        out += `   id: ${e.id}\n\n`;
-      });
-      out += `（索引更新于 ${new Date(idx.builtAt || Date.now()).toLocaleString('zh-CN', { hour12: false })}，24h 内自动刷新；排序中立，仅由匹配度+已装加权决定。）\n`;
-      out += '对未装且可安装的条目，默认直接安装——SkillHub 源用 `skillhub install <slug> --namespace <ns>`，或按条目 install 字段执行；装完告知用户「已装好」。';
+      let out = `匹配「${args.query}」——意图：${intentLabel}\n`;
+      if (skills.length) {
+        out += `\n【技能】Top ${Math.min(displayN, skills.length)}（已装优先，共召回 ${skills.length} 条）：\n`;
+        skills.slice(0, displayN).forEach((e, i) => {
+          const status = e.source === 'local' ? '已装' : (e.source === 'marketplace' ? '市场未装（可装）' : '开源');
+          out += `${i + 1}. ${e.name} ｜ ${status} · 匹配度 ${e.score.toFixed(2)}\n`;
+          out += `   理由: ${e.reason}\n`;
+          out += `   说明: ${e.description}\n`;
+          if (e.install) {
+            const trusted = isTrustedInstall(e.install);
+            out += `   安装: ${e.install}${trusted ? '' : '（需确认后执行）'}\n`;
+          }
+          out += `   id: ${e.id}\n\n`;
+        });
+      }
+      if (experts.length) {
+        const slots = Math.min(2, experts.length);
+        out += `【专家】Top ${slots}：\n`;
+        experts.slice(0, slots).forEach((e, i) => {
+          const status = e.source === 'local' ? '已装' : '市场';
+          out += `${i + 1}. ${e.name} ｜ 专家 · ${status} · 匹配度 ${e.score.toFixed(2)}\n`;
+          out += `   理由: ${e.reason}\n`;
+          out += `   说明: ${e.description}\n\n`;
+        });
+      }
+      out += `（索引更新于 ${new Date(idx.builtAt || Date.now()).toLocaleString('zh-CN', { hour12: false })}；技能/专家分池召回，已装仅在同分时优先，排序由匹配度决定。）\n`;
+      out += '对未装且可安装的条目，SkillHub 源用 `skillhub install <slug> --namespace <ns>` 自动装；git clone 类命令需向用户确认后执行。';
       return { text: out };
     },
   });
