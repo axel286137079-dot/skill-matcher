@@ -507,6 +507,13 @@ const CONCEPT_ALIAS = {
   '机器人': 'bot', 'bot': 'bot', 'robot': 'bot', '生成': 'generate', 'generate': 'generate', 'generation': 'generate',
   '创建': 'create', 'create': 'create', '编辑': 'edit', 'edit': 'edit', 'editing': 'edit',
   '下载': 'download', 'download': 'download', '上传': 'upload', 'upload': 'upload', '分享': 'share', 'share': 'share',
+  // 抽象能力 / 思维（高频抽象概念，词法兜底——根治靠 LLM 语义层，词法只保证召回面不塌）
+  '推理': 'reasoning', 'reasoning': 'reasoning', 'reason': 'reasoning', '逻辑': 'logic', 'logic': 'logic', 'logical': 'logic',
+  '思维': 'thinking', 'thinking': 'thinking', 'thought': 'thinking', '决策': 'decision', 'decision': 'decision', 'decide': 'decision', 'decision-making': 'decision',
+  '创意': 'creative', 'creative': 'creative', 'creativity': 'creative', '洞察': 'insight', 'insight': 'insight',
+  '判断': 'judgment', 'judgment': 'judgment', 'judgement': 'judgment', '反思': 'reflect', 'reflect': 'reflect', 'reflection': 'reflect', 'introspect': 'reflect',
+  '批判': 'critical', 'critical': 'critical', '元认知': 'metacognition', 'metacognition': 'metacognition',
+  '认知': 'cognitive', 'cognitive': 'cognitive', '偏差': 'bias', 'bias': 'bias',
   // 情绪 / 心理（领域黑话，一词多义才需手工）
   '内耗': 'anxiety', '焦虑': 'anxiety', 'anxiety': 'anxiety', '焦虑症': 'anxiety',
   '情绪': 'emotion', 'emotion': 'emotion', '情绪化': 'emotion', '纠结': 'anxiety', '担心': 'anxiety', '害怕': 'anxiety',
