@@ -2,7 +2,7 @@
   "name": "skill-matcher",
   "slug": "skill-matcher",
   "displayName": "技能与专家匹配器",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "summary": "装一个就够：读懂你的需求，从本机技能、市场技能、专家、开源社区里自动匹配并推荐最该用的那一个（Top3 + 理由 + 一键安装）。",
   "description": "技能与专家智能匹配器（Skill & Expert Matcher）——一个「元技能/路由技能」。现在的 AI 环境里技能和专家多到选不过来，它帮你在成堆选项里挑出当下最该用的那一个：按字面(L0)、语义(L1)、意图(L2)、潜在需求(L3)四层递进读懂需求（用户随口说、模糊说、甚至没直接提问但背后有真实需求都能读出来），自动探测本机已装技能/专家（WorkBuddy / Claude Code / CodeBuddy 多环境），并联网同步开源目录，输出 Top3 推荐 + 匹配理由 + 一键安装/启用方式。中立匹配，对所有技能与专家一视同仁，推荐排序只由需求匹配度决定。中英双语。",
   "author": "suge",
@@ -20,5 +20,6 @@
     "claude-code",
     "cursor"
   ],
-  "entry": "SKILL.md"
+  "entry": "SKILL.md",
+  "homepage": "https://github.com/axel286137079-dot/skill-matcher"
 }
