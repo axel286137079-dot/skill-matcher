@@ -92,7 +92,10 @@ platforms: [workbuddy, claude-code, cursor]
 **自动执行红线**：任何 `curl ... | sh/bash`、`wget` 管道执行、陌生域名脚本、非白名单来源的 install → **一律禁止自动执行**，展示完整命令 + 来源，请用户确认。
 
 **远程索引安全（防源被替换带毒）**：
-- `index/_sources.json` 的远程索引：首次拉取成功后，把内容 SHA256 记入 `index/_remote_hashes.json`；之后每次拉取**先校验哈希**，不一致则**拒绝更新并告警**（提示源可能被篡改，保持旧版继续用）。
+- `index/_sources.json` 的远程索引采用 **SHA256 + 目录修订号双门控**：首次拉取成功后，把内容 SHA256 与目录顶层**整数 `version`** 记入 `index/_remote_hashes.json`（同时存一份条目快照）。
+- 之后每次拉取：内容未变 → 接受；内容变了 → **仅当 `version` 是正整数且严格大于上次接受值**才接受（写回新哈希、新版本、新快照）。version 缺失 / 非正整数 / 没变大 / 内容变了但 version 没变 → **拒绝**，并**继续使用上次接受的那份目录**——不退回内置种子，也不把空数组当成成功。
+- ⚠️ **一次性迁移动作**：若 `index/_remote_hashes.json` 里还是**旧的纯字符串哈希**（无修订号），那么只要远端内容变过就会被判为 `rejected:no-baseline-version`，**永远停在旧目录**。此时删掉 `index/_remote_hashes.json`（插件版删 `~/.dsh/dsh-skill-matcher/cache.json`）再同步一次即可恢复，之后由修订号接管。
+- 发布侧：`export_open_source()` 的 `version` **内容变才自增**，且不会低于已发布版本——写死版本号会让所有已同步客户端永久拒绝更新。
 - 索引同步与贡献合并保持 opt-in + 共识 + 审计红线（见 CONTRIBUTING.md）。
 
 **执行纪律**：

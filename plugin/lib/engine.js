@@ -4,7 +4,7 @@
  * Faithful JS port of the WorkBuddy `skill-matcher` skill's bin/sync_index.py:
  *   - environment discovery (multi-harness, no hardcoded absolute paths)
  *   - local skill / expert parsing (SKILL.md frontmatter + plugin.json)
- *   - remote open-source index fetch (fail-silent, offline-safe, SHA256 anti-tamper)
+ *   - remote open-source index fetch (fail-silent, offline-safe, version-gated SHA256 anti-tamper)
  *   - priority merge (local > marketplace > opensource)
  *   - lexical retrieval (L0/L1): concept/alias canonicalization + IDF + multi-path recall;
  *     deeper L2/L3 reasoning stays with the LLM.
@@ -19,7 +19,8 @@ import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 
 const HOME = homedir();
-const CACHE_DIR = join(HOME, '.dsh', 'dsh-skill-matcher');
+// 缓存目录可用 SKILL_MATCHER_CACHE_DIR 覆盖（测试隔离用，与 SKILL_MATCHER_SKILLS_DIR 同一约定）。
+const CACHE_DIR = process.env.SKILL_MATCHER_CACHE_DIR || join(HOME, '.dsh', 'dsh-skill-matcher');
 const CACHE_FILE = join(CACHE_DIR, 'cache.json');
 const CONFIG_FILE = join(CACHE_DIR, 'config.json');
 const LOG_FILE = join(CACHE_DIR, 'query.log.jsonl');
@@ -305,42 +306,200 @@ export function isTrustedInstall(install) {
   return false;
 }
 
+// ---------- 3b. 远程目录：版本门控的防篡改 ----------
+//
+// 旧逻辑把 SHA256 钉死在可变 URL 上：内容一变就永久拒绝，且拒绝后**退回内置种子**
+// 并写回缓存 —— 已同步过的客户端再也拿不到目录更新。
+//
+// 新逻辑：SHA256 仍然校验，但**接受条件是「能被证明是正常递增的更新」**——
+// 内容变了且目录修订号（整数 version）严格大于上次接受的值才接受；
+// 拒绝时继续用上次接受的那份目录，绝不退回种子、也绝不把空数组当成成功。
+
+/** 目录修订号必须是正整数；缺失、非整数、0 或负数一律不算有效修订号。 */
+export function isCatalogVersion(v) {
+  return Number.isInteger(v) && v > 0;
+}
+
+/** 从目录 JSON 顶层读整数修订号。取不到返回 null（不得当成 0 或「最新」）。 */
+export function readCatalogVersion(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+  return isCatalogVersion(data.version) ? data.version : null;
+}
+
+/** 目录条目的 tags 一律规整为**字符串数组**（引擎按字符串标签打分，勿改成 {zh} 对象）。
+ *  只保证类型与去空，不改写标签本身的值。 */
+export function normalizeTags(tags) {
+  if (!Array.isArray(tags)) return [];
+  return tags.filter((t) => typeof t === 'string' && t.trim() !== '');
+}
+
+/** 直接读缓存原文（不像 readCache 那样要求 skills/experts 齐全），
+ *  保证远程目录记录不会因为半成品缓存被静默丢弃。 */
+function readCacheRaw() {
+  try {
+    if (existsSync(CACHE_FILE)) {
+      const data = JSON.parse(readFileSync(CACHE_FILE, 'utf8'));
+      if (data && typeof data === 'object') return data;
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+/** 把一条远程源记录规整为 { hash, version, entries }；
+ *  兼容旧格式（纯字符串哈希 → 无 version、无条目快照）。 */
+function normalizeRecord(raw) {
+  if (typeof raw === 'string') return { hash: raw || null, version: null, entries: null };
+  if (raw && typeof raw === 'object') {
+    return {
+      hash: typeof raw.hash === 'string' && raw.hash ? raw.hash : null,
+      version: isCatalogVersion(raw.version) ? raw.version : null,
+      entries: Array.isArray(raw.entries) ? raw.entries : null,
+    };
+  }
+  return null;
+}
+
+/**
+ * 读取某个远程源的「已接受」记录。
+ *   - 新格式：cache.remoteCatalog[url] = { hash, version, entries, acceptedAt }
+ *   - 旧格式：cache.remoteHashes[url]  = "<sha256 字符串>"（能读，不崩）
+ * 返回 { hash, version, entries }；无记录返回 null。
+ */
+export function readRemoteRecord(cache, url) {
+  const cur = normalizeRecord(cache?.remoteCatalog?.[url]);
+  if (cur && cur.hash) return cur;
+  return normalizeRecord(cache?.remoteHashes?.[url]);
+}
+
+/**
+ * 远程目录更新裁决（纯函数，便于测试）。
+ *
+ *   - 无记录（首次拉取）→ 接受，记录 hash + version
+ *   - hash 相同（内容未变）→ 接受（幂等；旧记录借此补上 version）
+ *   - hash 变了，但 version 是正整数且**严格大于**上次接受值 → 接受
+ *   - 其余（version 缺失 / 非正整数 / 没变大，或内容变了但 version 没变）→ 拒绝
+ *
+ * 防篡改仍然在：不是「哈希不同就一律接受」。
+ * 返回 { accept, reason, version }。
+ */
+export function decideRemoteUpdate({ digest, version, record }) {
+  const prevHash = record?.hash || null;
+  const prevVersion = isCatalogVersion(record?.version) ? record.version : null;
+  const nextVersion = isCatalogVersion(version) ? version : null;
+
+  if (!prevHash) return { accept: true, reason: 'first-fetch', version: nextVersion };
+  if (prevHash === digest) {
+    return { accept: true, reason: 'unchanged', version: nextVersion ?? prevVersion };
+  }
+  if (nextVersion === null) return { accept: false, reason: 'rejected:version-missing', version: null };
+  if (prevVersion === null) return { accept: false, reason: 'rejected:no-baseline-version', version: null };
+  if (nextVersion <= prevVersion) return { accept: false, reason: 'rejected:version-not-increased', version: null };
+  return { accept: true, reason: 'version-bumped', version: nextVersion };
+}
+
+/** 目录条目归一化：保留远程 tags 与条目**自身**的 origin（origin 缺失才回退到源名）。 */
+export function normalizeRemoteEntries(data) {
+  const lst = Array.isArray(data) ? data : (data?.skills || data?.plugins || []);
+  if (!Array.isArray(lst)) return [];
+  return lst
+    .filter((it) => it && (it.id || it.name))
+    .map((it) => ({
+      id: it.id || it.name,
+      name: it.name || it.id,
+      description: it.description || '',
+      install: it.install || DEFAULT_REMOTE.install_hint || null,
+      source: 'opensource',
+      kind: 'skill',
+      tags: normalizeTags(it.tags),
+      origin: it.origin || DEFAULT_REMOTE.name,
+    }));
+}
+
+/** 上次接受的条目：优先用记录里的快照；旧记录没有快照时从上次索引里回收 opensource 条目。 */
+function lastAcceptedEntries(cache, record) {
+  if (Array.isArray(record?.entries) && record.entries.length) return record.entries;
+  return (cache?.skills || []).filter((s) => s && s.source === 'opensource');
+}
+
+/** 写回某远程源的已接受记录（读改写，保留缓存其余字段）。 */
+function saveRemoteRecord(url, record) {
+  const prev = readCacheRaw() || {};
+  writeCache({
+    ...prev,
+    remoteCatalog: { ...(prev.remoteCatalog || {}), [url]: record },
+    // 同步维护旧键，便于回退到旧版本客户端时仍能读到哈希
+    remoteHashes: { ...(prev.remoteHashes || {}), [url]: record.hash },
+  });
+}
+
+/**
+ * 拉取远程开源目录（version-gated，失败静默、离线安全）。
+ *
+ * 返回 { entries, accepted, reason, version, hash }：
+ *   - entries：**应当使用的开源条目**——本次接受则是新条目，拒绝则是上次接受的目录
+ *   - accepted：本次是否接受了新内容
+ *   - reason：first-fetch | unchanged | version-bumped | rejected:* | offline | http-* | parse-error | timeout | network-error
+ *
+ * ⚠️ 拒绝时**不会**退回内置种子，也不会拿空数组冒充成功。
+ */
 export async function fetchRemoteSkills(offline) {
-  if (offline) return [];
+  const cache = readCacheRaw();
+  const record = readRemoteRecord(cache, DEFAULT_REMOTE.url);
+  const fallback = (reason, extra = {}) => ({
+    entries: lastAcceptedEntries(cache, record),
+    accepted: false,
+    reason,
+    version: record?.version ?? null,
+    hash: record?.hash ?? null,
+    ...extra,
+  });
+
+  if (offline) return fallback('offline');
+
+  let res;
   try {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 5000);
-    const res = await fetch(DEFAULT_REMOTE.url, { signal: ac.signal });
-    clearTimeout(timer);
-    if (!res.ok) return [];
-    // 防篡改：拉取内容 SHA256，与上次记录比对，不一致拒绝更新
+    try {
+      res = await fetch(DEFAULT_REMOTE.url, { signal: ac.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (e) {
+    return fallback(e?.name === 'AbortError' ? 'timeout' : 'network-error');
+  }
+
+  try {
+    if (!res.ok) return fallback(`http-${res.status}`);
     const buf = Buffer.from(await res.arrayBuffer());
     const digest = createHash('sha256').update(buf).digest('hex');
-    const known = readCache()?.remoteHashes?.[DEFAULT_REMOTE.url];
-    if (known && known !== digest) {
-      console.warn('[skill-matcher] remote index SHA256 mismatch; keep old version (source may be tampered)');
-      return [];
+
+    let data;
+    try {
+      data = JSON.parse(buf.toString('utf-8'));
+    } catch {
+      return fallback('parse-error');
     }
-    const data = JSON.parse(buf.toString('utf-8'));
-    if (!known) {
-      const prev = readCache() || {};
-      writeCache({ ...prev, remoteHashes: { ...(prev.remoteHashes || {}), [DEFAULT_REMOTE.url]: digest } });
+
+    const version = readCatalogVersion(data);
+    const verdict = decideRemoteUpdate({ digest, version, record });
+    if (!verdict.accept) {
+      console.warn(`[skill-matcher] 远程目录更新被拒绝（${verdict.reason}）；继续使用上次接受的目录`
+        + (record?.version != null ? `（version ${record.version}）` : '')
+        + (record?.version == null ? '（旧记录无修订号；如确为正常更新，请删除缓存后重试）' : ''));
+      return fallback(verdict.reason, { rejectedHash: digest, rejectedVersion: version });
     }
-    const lst = Array.isArray(data) ? data : (data.skills || data.plugins || []);
-    return lst
-      .filter((it) => it && (it.id || it.name))
-      .map((it) => ({
-        id: it.id || it.name,
-        name: it.name || it.id,
-        description: it.description || '',
-        install: it.install || DEFAULT_REMOTE.install_hint || null,
-        source: 'opensource',
-        kind: 'skill',
-        tags: it.tags || [],
-        origin: it.origin || DEFAULT_REMOTE.name,
-      }));
-  } catch {
-    return [];
+
+    const entries = normalizeRemoteEntries(data);
+    saveRemoteRecord(DEFAULT_REMOTE.url, {
+      hash: digest,
+      version: verdict.version,
+      acceptedAt: Date.now(),
+      entries,
+    });
+    return { entries, accepted: true, reason: verdict.reason, version: verdict.version, hash: digest };
+  } catch (e) {
+    return fallback(`network-error:${e?.name || 'Error'}`);
   }
 }
 
@@ -757,14 +916,18 @@ export async function getIndex({ cwd, offline = false } = {}) {
     return fileCache;
   }
   const idx = buildIndex(cwd, { offline: false });
-  const remote = await fetchRemoteSkills(false);
-  const merged = mergeByPriority(idx.skills, remote.length ? remote : SEED_OPENSOURCE);
+  const remoteRes = await fetchRemoteSkills(false);
+  // 只有「远程目录确实不可用」（首次且拉不到 / 网络异常）才退回内置种子。
+  // 「更新被拒绝」不算不可用 —— 此时 remoteRes.entries 是上次接受的目录，必须继续用它。
+  const catalog = remoteRes.entries || [];
+  const merged = mergeByPriority(idx.skills, catalog.length ? catalog : SEED_OPENSOURCE);
   const expertIds = new Set(idx.experts.map((e) => e.id));
   const finalSkills = dedupeByName(merged.filter((s) => !expertIds.has(s.id)));
   const stats = attachStats(finalSkills, idx.experts);
-  const prev = readCache() || {};
+  const prev = readCacheRaw() || {};
   const wrapped = { ...stats, builtAt: now, offline: false, localFp: fp,
-    remoteHashes: prev.remoteHashes || {} };
+    remoteHashes: prev.remoteHashes || {},
+    remoteCatalog: prev.remoteCatalog || {} };
   _memCache = wrapped;
   writeCache(wrapped);
   return wrapped;
