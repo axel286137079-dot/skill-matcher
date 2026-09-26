@@ -9,6 +9,7 @@
   5. 旧格式（纯字符串哈希）记录：能读、不崩；内容变了则拒绝
   6. Python 路径不再丢 tags，也不再覆盖条目 origin
   7. 导出目录的修订号：内容变才 +1，且不低于已发布版本
+  8. 本机同名安装不能遮蔽手动精选中的开源发布条目
 
 运行：
   python3 -m unittest discover -s tests -v
@@ -233,6 +234,25 @@ class RemoteGateTest(unittest.TestCase):
         }
         self.assertEqual(S._published_floor(status), 9)
         self.assertEqual(S._published_floor({}), 0)
+
+    # ---------- 8. 发布目录不受本机安装遮蔽 ----------
+    def test_export_restores_manual_opensource_entry_shadowed_by_local(self):
+        S.write_json(self.out / "_manual_skills.json", [
+            {"id": "docx", "name": "docx", "source": "opensource",
+             "origin": "anthropics/skills", "tags": ["document"]},
+            {"id": "manual-only", "name": "manual-only", "source": "manual"},
+        ])
+        # collect/merge 后同 id 的已安装项是 local；它不应让 docx 从全局目录消失。
+        S.export_open_source([
+            {"id": "docx", "name": "installed docx", "source": "local"},
+            {"id": "alpha", "name": "alpha", "source": "opensource"},
+        ])
+        exported = self._export()["skills"]
+        self.assertEqual([item["id"] for item in exported], ["alpha", "docx"])
+        docx = next(item for item in exported if item["id"] == "docx")
+        self.assertEqual(docx["source"], "opensource")
+        self.assertEqual(docx["origin"], "anthropics/skills")
+        self.assertEqual(docx["tags"], ["document"])
 
 
 if __name__ == "__main__":

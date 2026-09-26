@@ -727,7 +727,18 @@ def export_open_source(skills, floor_version=0):
     写死版本号会让已同步的客户端永久拒绝更新。未显式指定时：内容有变则 +1，内容未变则沿用；
     且绝不会低于「已发布版本的已知下界 floor_version」。
     """
-    os_items = [s for s in skills if s.get("source") == "opensource"]
+    # 本机安装状态不能改写全局发布目录。某个开源技能若已安装，合并后的
+    # `skills` 里可能只剩同 id 的 local 条目；仍需从手动精选源补回其
+    # opensource 发布记录，否则一次本地同步就会把中央目录条目删掉。
+    by_id = {
+        s["id"]: s for s in skills
+        if s.get("source") == "opensource" and s.get("id")
+    }
+    for item in load_manual("skills"):
+        if (item.get("source") == "opensource" and item.get("id")
+                and item["id"] not in by_id):
+            by_id[item["id"]] = item
+    os_items = list(by_id.values())
     path = OUT_DIR / "opensource-index.json"
     try:
         prev = json.loads(path.read_text(encoding="utf-8"))
