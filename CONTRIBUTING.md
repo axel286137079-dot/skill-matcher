@@ -46,6 +46,26 @@ index.json                  # 全局开源技能目录（联网同步的目标�
 contributions/<user>.json   # 各贡献者的提交（待审核）
 ```
 
+## 本地测试
+
+```bash
+# 插件（Node）：远程目录版本门控
+cd plugin && node --test test/*.test.mjs      # 等价于 npm test
+
+# 同步脚本（Python）：裁决逻辑 / tags / origin / 导出修订号
+python3 -m unittest discover -s tests -v
+```
+
+## 发布目录时的修订号规则（维护者必读）
+
+`index.json` 顶层的 `version` 是**整数修订号**，客户端只在它**严格变大**时才接受目录更新：
+
+- 内容有变化 → 必须把 `version` 递增后再发布，否则**所有已同步的客户端都会拒绝这次更新**（并继续使用旧目录）。
+- 内容没变化 → 不要动 `version`。
+- 运行 `python3 bin/sync_index.py` 时会自动处理导出的 `index/opensource-index.json`：内容变才自增，且不会低于本次拉取到的已发布版本。
+
+> 历史遗留：早期客户端存的是「纯字符串哈希、无修订号」。这类客户端需要**一次性**删除本地的哈希记录（`index/_remote_hashes.json`，插件版是 `~/.dsh/dsh-skill-matcher/cache.json`）才能收到本次及以后的更新，之后由修订号接管。
+
 ## 维护者
 
 @axel286137079-dot 及其 AI 审核助手。

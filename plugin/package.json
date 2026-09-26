@@ -4,6 +4,9 @@
   "description": "Skill & Expert Matcher for DeepSeek Harness (DSH): reads the user's need and auto-matches the most relevant local skill, marketplace skill, expert, or open-source entry — Top-N ranking, neutral, multi-harness discovery. Functionally identical to the WorkBuddy `skill-matcher` skill.",
   "type": "module",
   "main": "lib/index.js",
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
   "exports": {
     ".": "./lib/index.js",
     "./package.json": "./package.json"

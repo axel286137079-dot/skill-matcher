@@ -8,7 +8,10 @@
      （WorkBuddy 标准位 ~/.workbuddy、Claude Code ~/.claude、项目级 .workbuddy、
       通用 ~/.skills，且支持环境变量覆盖）。
   2. 远程开源索引：index/_sources.json 配置远程 JSON 索引 URL，联网时自动拉取
-     合并（失败不阻塞，离线可用）。
+     合并（失败不阻塞，离线可用）。防篡改 = SHA256 **+ 目录修订号** 双门控：
+     内容变了必须同时满足「顶层 version 是正整数且严格大于上次接受值」才接受；
+     拒绝时继续用上次接受的目录，不退回内置种子。
+     已同步过的客户端若要接受新目录，需要服务端把 version 递增发布。
   3. 保鲜：SKILL.md 匹配前检查索引新鲜度，过期自动重跑本脚本。
 
 数据源（按优先级，后者不覆盖前者）：
@@ -41,17 +44,137 @@ HASH_FILE = OUT_DIR / "_remote_hashes.json"
 
 
 def _load_remote_hashes():
-    """读取远程索引哈希记录（url -> sha256），用于防篡改校验。"""
+    """读取远程索引记录（url -> 记录）。
+
+    兼容两种历史格式：
+      - 旧：{url: "<sha256 字符串>"}（无修订号、无条目快照）
+      - 新：{url: {hash, version, accepted_at, entries}}
+    """
     try:
-        return json.loads(HASH_FILE.read_text(encoding="utf-8"))
+        data = json.loads(HASH_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
 
-def _save_remote_hash(url, digest):
+def _is_catalog_version(v):
+    """目录修订号必须是正整数（bool 是 int 的子类，须显式排除）。"""
+    return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+
+def _read_catalog_version(data):
+    """从目录 JSON 顶层取整数修订号；取不到返回 None（不得当成 0 或「最新」）。"""
+    if not isinstance(data, dict):
+        return None
+    v = data.get("version")
+    return v if _is_catalog_version(v) else None
+
+
+def _normalize_record(raw):
+    """把一条远程源记录规整为 {hash, version, entries}；兼容旧格式（纯字符串哈希）。"""
+    if isinstance(raw, str):
+        return {"hash": raw or None, "version": None, "entries": None}
+    if isinstance(raw, dict):
+        h, v, e = raw.get("hash"), raw.get("version"), raw.get("entries")
+        return {
+            "hash": h if isinstance(h, str) and h else None,
+            "version": v if _is_catalog_version(v) else None,
+            "entries": e if isinstance(e, list) and e else None,
+        }
+    return None
+
+
+def read_remote_record(url):
+    """读取某远程源的「已接受」记录；无记录返回 None。"""
+    return _normalize_record(_load_remote_hashes().get(url))
+
+
+def _save_remote_record(url, digest, version, entries):
     h = _load_remote_hashes()
-    h[url] = digest
+    h[url] = {
+        "hash": digest,
+        "version": version,
+        "accepted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "entries": entries,
+    }
     write_json(HASH_FILE, h)
+
+
+def decide_remote_update(digest, version, record):
+    """远程目录更新裁决（纯函数，便于测试）。返回 (accept, reason, version)。
+
+      - 无记录（首次拉取）→ 接受，记录 hash + version
+      - hash 相同（内容未变）→ 接受（幂等；旧记录借此补上 version）
+      - hash 变了，但 version 是正整数且**严格大于**上次接受值 → 接受
+      - 其余（version 缺失 / 非正整数 / 没变大，或内容变了但 version 没变）→ 拒绝
+
+    防篡改仍然在：不是「哈希不同就一律接受」。
+    """
+    prev = record if isinstance(record, dict) else _normalize_record(record)
+    prev_hash = (prev or {}).get("hash")
+    prev_ver = (prev or {}).get("version")
+    next_ver = version if _is_catalog_version(version) else None
+
+    if not prev_hash:
+        return True, "first-fetch", next_ver
+    if prev_hash == digest:
+        return True, "unchanged", next_ver if next_ver is not None else prev_ver
+    if next_ver is None:
+        return False, "rejected:version-missing", None
+    if prev_ver is None:
+        return False, "rejected:no-baseline-version", None
+    if next_ver <= prev_ver:
+        return False, "rejected:version-not-increased", None
+    return True, "version-bumped", next_ver
+
+
+def _normalize_tags(tags):
+    """目录条目的 tags 一律规整为**字符串数组**（引擎按字符串标签打分，勿改成 {zh} 对象）。
+    只保证类型与去空，不改写标签本身的值。"""
+    if not isinstance(tags, list):
+        return []
+    return [t for t in tags if isinstance(t, str) and t.strip()]
+
+
+def normalize_remote_entries(data, default_origin, install_hint=""):
+    """目录条目归一化：保留远程 tags 与条目**自身**的 origin（origin 缺失才回退到源名）。"""
+    lst = data if isinstance(data, list) else (
+        (data.get("skills") or data.get("plugins") or []) if isinstance(data, dict) else [])
+    out = []
+    for it in lst:
+        if not isinstance(it, dict):
+            continue
+        iid = it.get("id") or it.get("name")
+        if not iid:
+            continue
+        out.append({
+            "id": iid,
+            "name": it.get("name") or iid,
+            "description": it.get("description", ""),
+            "install": it.get("install") or install_hint,
+            "source": "opensource",
+            "kind": "skill",
+            "tags": _normalize_tags(it.get("tags")),
+            "origin": it.get("origin") or default_origin,
+        })
+    return out
+
+
+def _last_accepted_entries():
+    """上次接受的开源目录（旧记录没有条目快照时，从已导出的全局目录回收）。"""
+    try:
+        d = json.loads((OUT_DIR / "opensource-index.json").read_text(encoding="utf-8"))
+        lst = d.get("skills") if isinstance(d, dict) else d
+        return [x for x in (lst or []) if isinstance(x, dict) and x.get("source") == "opensource"]
+    except Exception:
+        return []
+
+
+def _record_entries(record):
+    """记录里存的条目快照；旧记录没有快照则退回上次导出的开源目录。"""
+    if record and record.get("entries"):
+        return record["entries"]
+    return _last_accepted_entries()
 
 
 # ---------- 1. 环境探测 ----------
@@ -266,51 +389,95 @@ def collect_experts():
     return items
 
 
-def fetch_remote_skills(offline=False):
-    """拉取 index/_sources.json 里配置的远程开源索引（失败静默跳过）。"""
+def _http_get(url, timeout=5):
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return r.read()
+
+
+def fetch_remote_skills(offline=False, opener=None, sources_path=None):
+    """拉取 index/_sources.json 里配置的远程开源索引（version-gated，失败静默）。
+
+    返回 (items, status)：
+      - items：**应当使用的开源条目** —— 本次接受则是新条目，拒绝则是上次接受的目录
+      - status：{url: {reason, version, hash}}，便于调用方与测试断言
+
+    ⚠️ 拒绝时**不会**退回内置种子，也不会拿空列表冒充成功。
+    """
+    status = {}
     if offline:
-        return []
-    src = OUT_DIR / "_sources.json"
+        # 离线不拉取，但仍沿用上次接受的开源目录（不退回种子）
+        return _dedupe_entries(_last_accepted_entries()), {
+            "__offline__": {"reason": "offline", "version": None, "hash": None}}
+
+    src = sources_path if sources_path is not None else (OUT_DIR / "_sources.json")
     if not src.exists():
-        return []
+        return [], status
     try:
         sources = json.loads(src.read_text(encoding="utf-8"))
     except Exception:
-        return []
-    items = []
+        return [], status
+
+    records = _load_remote_hashes()
+    seen, items = set(), []
+
+    def _extend(extra):
+        for it in extra:
+            if isinstance(it, dict) and it.get("id") and it["id"] not in seen:
+                seen.add(it["id"])
+                items.append(it)
+
     for s in sources.get("remote_indexes", []):
         url = s.get("url")
         if not url:
             continue
+        name = s.get("name", url)
+        record = _normalize_record(records.get(url))
+        keep = {"reason": "unknown", "version": (record or {}).get("version"),
+                "hash": (record or {}).get("hash")}
         try:
-            with urllib.request.urlopen(url, timeout=5) as r:
-                raw = r.read()
-            digest = hashlib.sha256(raw).hexdigest()
-            known = _load_remote_hashes().get(url)
-            if known and known != digest:
-                print(f"  [remote] {s.get('name', url)} 内容哈希与上次不一致，已拒绝更新"
-                      f"（源可能被篡改，保持旧版；如确为正常更新请清除 index/_remote_hashes.json）")
-                continue
-            data = json.loads(raw.decode("utf-8"))
-            if not known:
-                _save_remote_hash(url, digest)
-            lst = data if isinstance(data, list) else (data.get("skills") or data.get("plugins") or [])
-            for it in lst:
-                if not it.get("id") and not it.get("name"):
-                    continue
-                iid = it.get("id") or it["name"]
-                items.append({
-                    "id": iid,
-                    "name": it.get("name") or iid,
-                    "description": it.get("description", ""),
-                    "install": it.get("install") or s.get("install_hint", ""),
-                    "source": "opensource",
-                    "origin": s.get("name", url),
-                })
-            print(f"  [remote] {s.get('name', url)}: +{len(lst)} 条")
+            raw = (opener or _http_get)(url)
         except Exception as e:
-            print(f"  [remote] {s.get('name', url)} 跳过: {type(e).__name__}")
-    return items
+            status[url] = {**keep, "reason": f"network-error:{type(e).__name__}"}
+            print(f"  [remote] {name} 跳过: {type(e).__name__}")
+            _extend(_record_entries(record))
+            continue
+
+        digest = hashlib.sha256(raw).hexdigest()
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except Exception as e:
+            status[url] = {**keep, "reason": "parse-error"}
+            print(f"  [remote] {name} 跳过: JSON 解析失败（{type(e).__name__}）")
+            _extend(_record_entries(record))
+            continue
+
+        version = _read_catalog_version(data)
+        accept, reason, new_version = decide_remote_update(digest, version, record)
+        if not accept:
+            status[url] = {**keep, "reason": reason}
+            hint = (f"（version {record['version']}）" if (record or {}).get("version")
+                    else "（旧记录无修订号；如确为正常更新，请删除 index/_remote_hashes.json 后重试）")
+            print(f"  [remote] {name} 更新被拒绝（{reason}）；继续使用上次接受的目录{hint}")
+            _extend(_record_entries(record))
+            continue
+
+        entries = normalize_remote_entries(data, name, s.get("install_hint", ""))
+        _save_remote_record(url, digest, new_version, entries)
+        status[url] = {"reason": reason, "version": new_version, "hash": digest}
+        _extend(entries)
+        vtxt = f"，version {new_version}" if new_version is not None else ""
+        print(f"  [remote] {name}: +{len(entries)} 条（{reason}{vtxt}）")
+    return items, status
+
+
+def _dedupe_entries(entries):
+    """按 id 去重（保持顺序）。"""
+    seen, out = set(), []
+    for it in entries:
+        if isinstance(it, dict) and it.get("id") and it["id"] not in seen:
+            seen.add(it["id"])
+            out.append(it)
+    return out
 
 
 def load_manual(kind: str):
@@ -540,19 +707,62 @@ def audit_contributions():
     print("→ AI 审核员据此裁决：ok → approved/，flag → 人工复查")
 
 
-def export_open_source(skills):
-    """导出全局开源目录（数据资产）：发布到 GitHub 后作为远程源 index.json。"""
-    os_items = [s for s in skills if s.get("source") == "opensource"]
+def _catalog_digest(skills):
+    """目录内容指纹（仅技能条目本体），用于判断修订号是否需要自增。"""
+    payload = json.dumps(skills, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _published_floor(status):
+    """已发布目录的修订号下界：本次拉取到的 / 上次接受的，取其中的最大值。"""
+    vs = [v.get("version") for v in (status or {}).values() if isinstance(v, dict)]
+    vs = [v for v in vs if _is_catalog_version(v)]
+    return max(vs) if vs else 0
+
+
+def export_open_source(skills, floor_version=0):
+    """导出全局开源目录（数据资产）：发布到 GitHub 后作为远程源 index.json。
+
+    ⚠️ 修订号 version 必须**单调递增**——客户端只在 version 严格变大时才接受目录更新。
+    写死版本号会让已同步的客户端永久拒绝更新。未显式指定时：内容有变则 +1，内容未变则沿用；
+    且绝不会低于「已发布版本的已知下界 floor_version」。
+    """
+    # 本机安装状态不能改写全局发布目录。某个开源技能若已安装，合并后的
+    # `skills` 里可能只剩同 id 的 local 条目；仍需从手动精选源补回其
+    # opensource 发布记录，否则一次本地同步就会把中央目录条目删掉。
+    by_id = {
+        s["id"]: s for s in skills
+        if s.get("source") == "opensource" and s.get("id")
+    }
+    for item in load_manual("skills"):
+        if (item.get("source") == "opensource" and item.get("id")
+                and item["id"] not in by_id):
+            by_id[item["id"]] = item
+    os_items = list(by_id.values())
+    path = OUT_DIR / "opensource-index.json"
+    try:
+        prev = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        prev = {}
+    if not isinstance(prev, dict):
+        prev = {}
+    prev_version = _read_catalog_version(prev) or 0
+    floor = floor_version if _is_catalog_version(floor_version) else 0
+    digest = _catalog_digest(os_items)
+    if digest == prev.get("content_sha256") and prev_version >= max(floor, 1):
+        new_version = prev_version          # 内容未变：沿用，避免无谓的版本噪音
+    else:
+        new_version = max(prev_version, floor, 0) + 1
     data = {
         "name": "skill-matcher 开源技能目录",
         "description": "由 skill-matcher 维护的全局开源技能索引，供所有安装者联网同步。",
-        "version": 2,
+        "version": new_version,
+        "content_sha256": digest,
         "updated_at": time.strftime("%Y-%m-%d"),
         "skills": os_items,
     }
-    path = OUT_DIR / "opensource-index.json"
     write_json(path, data)
-    print(f"opensource 全局目录: {len(os_items)} 条 -> {path}")
+    print(f"opensource 全局目录: {len(os_items)} 条 (version {new_version}) -> {path}")
 
 
 def submit_contribution():
@@ -693,7 +903,8 @@ def main():
     print(f"专家市场: {[str(d) for d in discover_expert_roots()] or '（未发现）'}")
 
     skills_auto, local_ids = collect_skills()
-    add_only_new(skills_auto, fetch_remote_skills(offline=offline))
+    remote_items, remote_status = fetch_remote_skills(offline=offline)
+    add_only_new(skills_auto, remote_items)
     skills = merge_by_priority(skills_auto, load_manual("skills"))
 
     experts_auto = collect_experts()
@@ -706,7 +917,7 @@ def main():
     write_json(OUT_DIR / "experts.json", experts)
     print(f"skills:  {len(skills)}  (本地 {sum(1 for s in skills if s['source']=='local')} / 市场 {sum(1 for s in skills if s['source']=='marketplace')} / 开源 {sum(1 for s in skills if s['source']=='opensource')})")
     print(f"experts: {len(experts)}  (本地 {sum(1 for e in experts if e['source']=='local')} / 市场 {sum(1 for e in experts if e['source']=='marketplace')})")
-    export_open_source(skills)
+    export_open_source(skills, floor_version=_published_floor(remote_status))
     print(f"written to {OUT_DIR}")
 
 
