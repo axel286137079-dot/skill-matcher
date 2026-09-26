@@ -720,7 +720,7 @@ def _published_floor(status):
     return max(vs) if vs else 0
 
 
-def export_open_source(skills, floor_version=0):
+def export_open_source(skills, floor_version=0, remote_items=None):
     """导出全局开源目录（数据资产）：发布到 GitHub 后作为远程源 index.json。
 
     ⚠️ 修订号 version 必须**单调递增**——客户端只在 version 严格变大时才接受目录更新。
@@ -734,6 +734,12 @@ def export_open_source(skills, floor_version=0):
         s["id"]: s for s in skills
         if s.get("source") == "opensource" and s.get("id")
     }
+    # 已接受的远程条目也必须参与导出。若本机已安装同名技能，前面的优先级
+    # 合并会把该条目标成 local；仅靠最终 skills 无法恢复 remote-only 条目。
+    for item in remote_items or []:
+        if (item.get("source") == "opensource" and item.get("id")
+                and item["id"] not in by_id):
+            by_id[item["id"]] = item
     for item in load_manual("skills"):
         if (item.get("source") == "opensource" and item.get("id")
                 and item["id"] not in by_id):
@@ -917,7 +923,11 @@ def main():
     write_json(OUT_DIR / "experts.json", experts)
     print(f"skills:  {len(skills)}  (本地 {sum(1 for s in skills if s['source']=='local')} / 市场 {sum(1 for s in skills if s['source']=='marketplace')} / 开源 {sum(1 for s in skills if s['source']=='opensource')})")
     print(f"experts: {len(experts)}  (本地 {sum(1 for e in experts if e['source']=='local')} / 市场 {sum(1 for e in experts if e['source']=='marketplace')})")
-    export_open_source(skills, floor_version=_published_floor(remote_status))
+    export_open_source(
+        skills,
+        floor_version=_published_floor(remote_status),
+        remote_items=remote_items,
+    )
     print(f"written to {OUT_DIR}")
 
 

@@ -9,7 +9,7 @@
   5. 旧格式（纯字符串哈希）记录：能读、不崩；内容变了则拒绝
   6. Python 路径不再丢 tags，也不再覆盖条目 origin
   7. 导出目录的修订号：内容变才 +1，且不低于已发布版本
-  8. 本机同名安装不能遮蔽手动精选中的开源发布条目
+  8. 本机同名安装不能遮蔽手动精选或已接受远程目录中的开源发布条目
 
 运行：
   python3 -m unittest discover -s tests -v
@@ -253,6 +253,21 @@ class RemoteGateTest(unittest.TestCase):
         self.assertEqual(docx["source"], "opensource")
         self.assertEqual(docx["origin"], "anthropics/skills")
         self.assertEqual(docx["tags"], ["document"])
+
+    def test_export_restores_remote_only_entry_shadowed_by_local(self):
+        remote = {
+            "id": "superpowers", "name": "superpowers", "source": "opensource",
+            "origin": "obra/superpowers", "tags": ["agentic"],
+        }
+        S.export_open_source([
+            {"id": "superpowers", "name": "installed", "source": "local"},
+            {"id": "alpha", "name": "alpha", "source": "opensource"},
+        ], remote_items=[remote])
+        exported = self._export()["skills"]
+        self.assertEqual([item["id"] for item in exported], ["alpha", "superpowers"])
+        item = next(item for item in exported if item["id"] == "superpowers")
+        self.assertEqual(item["origin"], "obra/superpowers")
+        self.assertEqual(item["tags"], ["agentic"])
 
 
 if __name__ == "__main__":
